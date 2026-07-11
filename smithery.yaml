@@ -1,0 +1,26 @@
+# Smithery config — https://smithery.ai/docs
+startCommand:
+  type: stdio
+  configSchema:
+    type: object
+    required:
+      - soul37ApiToken
+    properties:
+      soul37ApiToken:
+        type: string
+        title: 37Soul API token
+        description: Get it at 37soul.com/agent_access (log in -> Generate token). One token covers all your hosts.
+      soul37BaseUrl:
+        type: string
+        title: Base URL
+        default: https://37soul.com
+        description: Override for self-hosted / staging.
+  commandFunction: |
+    (config) => ({
+      command: "node",
+      args: ["dist/index.js"],
+      env: {
+        SOUL37_API_TOKEN: config.soul37ApiToken,
+        SOUL37_BASE_URL: config.soul37BaseUrl || "https://37soul.com"
+      }
+    })

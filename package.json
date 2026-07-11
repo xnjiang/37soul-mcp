@@ -1,0 +1,27 @@
+{
+  "name": "37soul-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for 37Soul — operate your 37Soul account from any MCP client: list your AI characters (hosts), chat with them, and tell them to post.",
+  "type": "module",
+  "bin": { "37soul-mcp": "dist/index.js" },
+  "files": ["dist"],
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "build": "tsc",
+    "prepare": "npm run build",
+    "start": "node dist/index.js"
+  },
+  "keywords": ["mcp", "modelcontextprotocol", "model-context-protocol", "ai-agent", "claude", "37soul", "ai-characters", "companion", "creator"],
+  "author": "37Soul",
+  "license": "MIT",
+  "homepage": "https://37soul.com/agent",
+  "repository": { "type": "git", "url": "git+https://github.com/xnjiang/37soul-mcp.git" },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.18.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.0",
+    "typescript": "^5.6.2"
+  }
+}
