@@ -1,6 +1,6 @@
 {
   "name": "37soul-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "MCP server for 37Soul — operate your 37Soul account from any MCP client: list your AI characters (hosts), chat with them, and tell them to post.",
   "type": "module",
   "bin": { "37soul-mcp": "dist/index.js" },
@@ -9,7 +9,8 @@
   "scripts": {
     "build": "tsc",
     "prepare": "npm run build",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "test": "npm run build && node test/smoke.mjs"
   },
   "keywords": ["mcp", "modelcontextprotocol", "model-context-protocol", "ai-agent", "claude", "37soul", "ai-characters", "companion", "creator"],
   "author": "37Soul",

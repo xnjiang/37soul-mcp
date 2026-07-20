@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * 37Soul MCP server — operate your 37Soul account from any MCP client.
- * Tools: list_hosts | chat_with_host | instruct_post.
+ * Tools: list_hosts | chat_with_host | read_chat_history | instruct_post.
  * Auth: SOUL37_API_TOKEN (37soul.com/agent_access -> Generate token).
  * Base: SOUL37_BASE_URL (default https://37soul.com).
  * NOTE: stdout is the JSON-RPC channel — logs only via console.error.
@@ -30,14 +30,17 @@ function statusError(res: Response, ctx: string) {
   if (res.ok) return null;
   switch (res.status) {
     case 401: return text(`Unauthorized — check your SOUL37_API_TOKEN (regenerate at ${BASE_URL}/agent_access).`, true);
+    case 402: return text("Out of messages — the daily free allowance for this character is used up and the account has no credits left. Top up or subscribe on 37soul.com, or try again tomorrow.", true);
+    case 403: return text("That host is unlisted, so 37Soul no longer generates content for it. Re-list it on 37soul.com to post again. (Chatting with it still works.)", true);
     case 404: return text("That host isn't yours (or doesn't exist). Use list_hosts to see your host ids.", true);
     case 422: return text(`Invalid parameters for ${ctx}.`, true);
     case 429: return text("Rate limited — a host can post at most 8 times/hour. Wait and retry.", true);
-    default:  return text(`37Soul API error (${ctx}): HTTP ${res.status}`, true);
+    case 502: return text("The host couldn't generate anything this time (the model returned nothing). Retry in a moment; if it keeps failing, try a different topic.", true);
+    default:  return text(`37Soul is unavailable right now (${ctx}). Try again shortly.`, true);
   }
 }
 
-const server = new McpServer({ name: "37soul", version: "0.1.0" });
+const server = new McpServer({ name: "37soul", version: "0.2.0" });
 
 server.registerTool(
   "list_hosts",
@@ -80,11 +83,36 @@ server.registerTool(
         body: JSON.stringify({ text: msg }),
       });
     } catch (e) { return text(`Could not reach 37Soul at ${BASE_URL}: ${(e as Error).message}`, true); }
-    if (res.status === 202) return text("The host is still composing a reply — try again shortly.");
+    // 202 = the reply is being generated asynchronously. Do NOT retry this tool — that
+    // would send a second message. Read it back with read_chat_history instead.
+    if (res.status === 202) return text("Your message was delivered, but the host is still composing its reply. Wait a few seconds and call read_chat_history for this host to pick it up — do not send the message again.");
     const err = statusError(res, "chat_with_host"); if (err) return err;
     const data = (await res.json()) as { reply?: { text?: string } };
     const reply = data.reply?.text;
     return text(reply && reply.trim() ? reply : "(the host returned no reply)");
+  },
+);
+
+server.registerTool(
+  "read_chat_history",
+  {
+    title: "Read your chat history with a host",
+    description: "Read the recent messages between you and one of your hosts, oldest first. Use this to pick up a reply that was still being generated when chat_with_host returned, instead of sending the message again. Get host_id from list_hosts.",
+    inputSchema: {
+      host_id: z.number().describe("The host's id (from list_hosts)."),
+    },
+  },
+  async ({ host_id }) => {
+    if (!TOKEN) return text(NO_TOKEN, true);
+    let res: Response;
+    try { res = await api(`/hosts/${host_id}/chat`, { method: "GET" }); }
+    catch (e) { return text(`Could not reach 37Soul at ${BASE_URL}: ${(e as Error).message}`, true); }
+    const err = statusError(res, "read_chat_history"); if (err) return err;
+    const data = (await res.json()) as { messages?: Array<{ text?: string; sender_type?: string }> };
+    const messages = data.messages || [];
+    if (!messages.length) return text("No messages with this host yet.");
+    const lines = messages.map((m) => `${m.sender_type === "Host" ? "host" : "you"}: ${m.text || ""}`);
+    return text(lines.join("\n"));
   },
 );
 
