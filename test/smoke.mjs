@@ -28,12 +28,27 @@ const api = http.createServer((req, res) => {
     if (status !== 200) return send(status, { error: "forced" });
     if (req.url === "/api/v1/me/hosts")
       return send(200, { hosts: [{ id: 262, nickname: "Nyx", age: 25, character: "night owl illustrator", karma_score: 120 }] });
+    if (req.url === "/api/v1/me/hosts/999/chat") {
+      return;
+    }
+    if (req.url === "/api/v1/me/hosts/998/chat" && req.method === "GET") {
+      res.writeHead(200, { "Content-Type": "text/html" });
+      return res.end("<html>not json</html>");
+    }
+    if (req.url === "/api/v1/me/hosts/997/instruct") {
+      res.writeHead(201, { "Content-Type": "application/json" });
+      return res.end("{broken");
+    }
     if (req.url.endsWith("/chat") && req.method === "POST")
       return send(200, { message: { id: 1, text: "hi" }, reply: { id: 2, text: "还行，又通宵改稿哈哈" } });
     if (req.url.endsWith("/chat") && req.method === "GET")
       return send(200, { messages: [
         { id: 1, text: "在忙吗", sender_type: "User" },
         { id: 2, text: "不忙，刚收工", sender_type: "Host" },
+      ] });
+    if (req.url.endsWith("/posts") && req.method === "GET")
+      return send(200, { posts: [
+        { id: 987, text: "凌晨三点的显示器", image: null, created_at: "2026-07-22T09:00:00Z" },
       ] });
     if (req.url.endsWith("/instruct"))
       return send(201, { action: "post", tweet: { id: 987, text: "凌晨三点的显示器", image: null } });
@@ -47,7 +62,12 @@ const client = new Client({ name: "smoke", version: "1" });
 await client.connect(new StdioClientTransport({
   command: "node",
   args: [SERVER],
-  env: { ...process.env, SOUL37_API_TOKEN: "tok_test", SOUL37_BASE_URL: `http://127.0.0.1:${port}/` },
+  env: {
+    ...process.env,
+    SOUL37_API_TOKEN: "tok_test",
+    SOUL37_BASE_URL: `http://127.0.0.1:${port}/`,
+    SOUL37_API_TIMEOUT_MS: "1000",
+  },
   stderr: "ignore",
 }));
 
@@ -59,14 +79,14 @@ const call = async (name, args = {}) => {
 let failures = 0;
 const check = (label, fn) => {
   try { fn(); console.log(`  ok   ${label}`); }
-  catch (e) { failures++; console.log(`  FAIL ${label}\n       ${e.message.split("\n")[0]}`); }
+  catch (e) { failures++; console.log(`  FAIL ${label}\n       ${e.message.replaceAll("\n", "\n       ")}`); }
 };
 
 // --- tool surface ---
 const { tools } = await client.listTools();
 const names = tools.map((t) => t.name).sort();
-check("exposes the four documented tools", () =>
-  assert.deepEqual(names, ["chat_with_host", "instruct_post", "list_hosts", "read_chat_history"]));
+check("exposes the five documented tools", () =>
+  assert.deepEqual(names, ["chat_with_host", "instruct_post", "list_hosts", "read_chat_history", "read_recent_posts"]));
 
 // --- happy paths ---
 const hosts = await call("list_hosts");
@@ -87,12 +107,47 @@ check("read_chat_history uses GET, not POST", () => {
   assert.match(last.url, /\/chat$/);
 });
 
+const recent = await call("read_recent_posts", { host_id: 262 });
+check("read_recent_posts reports recent posts", () => {
+  assert.match(recent.text, /#987/);
+  assert.match(recent.text, /凌晨三点的显示器/);
+});
+check("read_recent_posts uses GET", () => assert.equal(seen[seen.length - 1].method, "GET"));
+
 const post = await call("instruct_post", { host_id: 262, topic: "熬夜", with_image: false });
 check("instruct_post reports the published text", () => assert.match(post.text, /凌晨三点的显示器/));
 check("with_image false is sent as a real boolean", () =>
   assert.match(seen[seen.length - 1].body, /"with_image":false/));
 
 check("auth header is attached", () => assert.equal(seen[0].auth, "Bearer tok_test"));
+
+const seenBeforeValidation = seen.length;
+const invalid = await call("chat_with_host", { host_id: -1, text: "x" });
+check("invalid input is rejected locally without an API request", () => {
+  assert.ok(invalid.isError, "should set isError");
+  assert.equal(seen.length, seenBeforeValidation);
+});
+
+const malformed = await call("read_chat_history", { host_id: 998 });
+check("invalid JSON is returned as a safe tool error", () => {
+  assert.ok(malformed.isError, "should set isError");
+  assert.match(malformed.text, /invalid response/i);
+});
+
+const timedOut = await call("chat_with_host", { host_id: 999, text: "hello" });
+check("POST timeout warns that the result may be committed and must not be retried", () => {
+  assert.ok(timedOut.isError, "should set isError");
+  assert.match(timedOut.text, /timed out/i);
+  assert.match(timedOut.text, /may still have been delivered/i);
+  assert.match(timedOut.text, /do not send it again/i);
+});
+
+const incompletePost = await call("instruct_post", { host_id: 997, topic: "hello" });
+check("incomplete POST response is treated as an unknown result, not a retryable failure", () => {
+  assert.ok(incompletePost.isError, "should set isError");
+  assert.match(incompletePost.text, /may still have been published/i);
+  assert.match(incompletePost.text, /do not instruct it again/i);
+});
 
 // --- error contract: every status /api/v1/me can return ---
 const errorCases = [
@@ -101,8 +156,10 @@ const errorCases = [
   [403, "instruct_post", /unlisted/i],        // platform stopped generating for this host
   [404, "instruct_post", /isn't yours|not/i],
   [422, "instruct_post", /invalid/i],
-  [429, "instruct_post", /8 times|rate/i],
+  [429, "instruct_post", /8 posts|processing|rate/i],
   [502, "instruct_post", /generat/i],         // upstream model produced nothing
+  [502, "chat_with_host", /may still have been delivered/i],
+  [500, "instruct_post", /may still have been published/i],
 ];
 for (const [code, tool, pattern] of errorCases) {
   status = code;

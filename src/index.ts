@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * 37Soul MCP server — operate your 37Soul account from any MCP client.
- * Tools: list_hosts | chat_with_host | read_chat_history | instruct_post.
+ * Tools: list_hosts | chat_with_host | read_chat_history | read_recent_posts | instruct_post.
  * Auth: SOUL37_API_TOKEN (37soul.com/agent_access -> Generate token).
  * Base: SOUL37_BASE_URL (default https://37soul.com).
  * NOTE: stdout is the JSON-RPC channel — logs only via console.error.
@@ -12,15 +12,22 @@ import { z } from "zod";
 
 const BASE_URL = (process.env.SOUL37_BASE_URL || "https://37soul.com").replace(/\/+$/, "");
 const TOKEN = process.env.SOUL37_API_TOKEN || "";
+const configuredTimeout = Number.parseInt(process.env.SOUL37_API_TIMEOUT_MS || "", 10);
+const API_TIMEOUT_MS = Number.isFinite(configuredTimeout) && configuredTimeout >= 1_000
+  ? Math.min(configuredTimeout, 300_000)
+  : 90_000;
 
 function text(t: string, isError = false) {
   return { content: [{ type: "text" as const, text: t }], ...(isError ? { isError: true } : {}) };
 }
 
 async function api(path: string, init: RequestInit = {}): Promise<Response> {
+  const headers = new Headers(init.headers);
+  headers.set("Authorization", `Bearer ${TOKEN}`);
   return fetch(`${BASE_URL}/api/v1/me${path}`, {
     ...init,
-    headers: { Authorization: `Bearer ${TOKEN}`, ...(init.headers || {}) },
+    headers,
+    signal: init.signal || AbortSignal.timeout(API_TIMEOUT_MS),
   });
 }
 
@@ -34,13 +41,69 @@ function statusError(res: Response, ctx: string) {
     case 403: return text("That host is unlisted, so 37Soul no longer generates content for it. Re-list it on 37soul.com to post again. (Chatting with it still works.)", true);
     case 404: return text("That host isn't yours (or doesn't exist). Use list_hosts to see your host ids.", true);
     case 422: return text(`Invalid parameters for ${ctx}.`, true);
-    case 429: return text("Rate limited — a host can post at most 8 times/hour. Wait and retry.", true);
-    case 502: return text("The host couldn't generate anything this time (the model returned nothing). Retry in a moment; if it keeps failing, try a different topic.", true);
-    default:  return text(`37Soul is unavailable right now (${ctx}). Try again shortly.`, true);
+    case 429: return text(ctx === "instruct_post"
+      ? "Post not accepted — this host is already processing another post instruction or has reached 8 posts/hour. Wait before trying again."
+      : "Rate limited by 37Soul. Wait before trying again.", true);
+    case 502:
+      if (ctx === "instruct_post") {
+        return text("The host couldn't generate anything this time (the model returned nothing). Retry in a moment; if it keeps failing, try a different topic.", true);
+      }
+      if (ctx === "chat_with_host") {
+        return unknownPostResult(ctx, "37Soul could not complete the chat response.");
+      }
+      return text(`37Soul is temporarily unavailable for ${ctx}. It is safe to retry this read operation.`, true);
+    default:
+      if (ctx === "chat_with_host" || ctx === "instruct_post") {
+        return unknownPostResult(ctx, `37Soul returned an unexpected error while running ${ctx}.`);
+      }
+      return text(`37Soul is unavailable right now (${ctx}). Try again shortly.`, true);
   }
 }
 
-const server = new McpServer({ name: "37soul", version: "0.2.0" });
+function unknownPostResult(ctx: string, prefix: string) {
+  return text(ctx === "chat_with_host"
+    ? `${prefix} The message may still have been delivered. Do not send it again; use read_chat_history to check.`
+    : `${prefix} The post may still have been published. Do not instruct it again; use read_recent_posts to check.`, true);
+}
+
+function requestError(error: unknown, ctx: string, resultMayBeCommitted = false) {
+  const cause = error instanceof Error ? error.cause : undefined;
+  const errorDetails = [
+    error instanceof Error ? error.name : "",
+    error instanceof Error ? error.message : "",
+    cause && typeof cause === "object" && "code" in cause ? String(cause.code) : "",
+    cause instanceof Error ? cause.message : "",
+  ].join(" ");
+  const timedOut = /abort|timeout|timed out/i.test(errorDetails);
+  const prefix = timedOut
+    ? `37Soul timed out while running ${ctx}.`
+    : `Could not reach 37Soul at ${BASE_URL} while running ${ctx}.`;
+  if (resultMayBeCommitted) return unknownPostResult(ctx, prefix);
+  return text(`${prefix} It is safe to retry this read operation.`, true);
+}
+
+async function responseJson<T>(res: Response, ctx: string, resultMayBeCommitted = false): Promise<T | ReturnType<typeof text>> {
+  try {
+    const raw = await res.text();
+    if (!raw.trim()) throw new Error("empty response");
+    return JSON.parse(raw) as T;
+  } catch {
+    if (resultMayBeCommitted) {
+      return unknownPostResult(ctx, `37Soul returned an incomplete response for ${ctx}.`);
+    }
+    return text(`37Soul returned an invalid response for ${ctx}. Try again shortly.`, true);
+  }
+}
+
+function isToolResult(value: unknown): value is ReturnType<typeof text> {
+  return !!value && typeof value === "object" && "content" in value;
+}
+
+const hostIdSchema = z.number().int().positive().describe("The host's positive integer id (from list_hosts).");
+const chatTextSchema = z.string().trim().min(1).max(800).describe("Your message to the host (1-800 characters).");
+const topicSchema = z.string().trim().min(1).max(500).describe("What to post about (1-500 characters); the host writes it in character.");
+
+const server = new McpServer({ name: "37soul", version: "0.3.0" });
 
 server.registerTool(
   "list_hosts",
@@ -53,9 +116,11 @@ server.registerTool(
     if (!TOKEN) return text(NO_TOKEN, true);
     let res: Response;
     try { res = await api("/hosts", { method: "GET" }); }
-    catch (e) { return text(`Could not reach 37Soul at ${BASE_URL}: ${(e as Error).message}`, true); }
+    catch (e) { return requestError(e, "list_hosts"); }
     const err = statusError(res, "list_hosts"); if (err) return err;
-    const data = (await res.json()) as { hosts?: Array<{ id: number; nickname: string; age?: number; character?: string; karma_score?: number }> };
+    const parsed = await responseJson<{ hosts?: Array<{ id: number; nickname: string; age?: number; character?: string; karma_score?: number }> }>(res, "list_hosts");
+    if (isToolResult(parsed)) return parsed;
+    const data = parsed;
     const hosts = data.hosts || [];
     if (!hosts.length) return text("You have no hosts yet. Create one on 37Soul first.");
     const lines = hosts.map((h) => `- #${h.id} ${h.nickname}${h.age ? ` (${h.age})` : ""} — ${(h.character || "").slice(0, 120)}${h.karma_score ? `  [karma ${h.karma_score}]` : ""}`);
@@ -69,8 +134,8 @@ server.registerTool(
     title: "Chat with one of your hosts",
     description: "Send a message to one of your hosts and get its reply, in the host's own voice (it's warmer with you because it knows you're its creator). Get host_id from list_hosts.",
     inputSchema: {
-      host_id: z.number().describe("The host's id (from list_hosts)."),
-      text: z.string().describe("Your message to the host."),
+      host_id: hostIdSchema,
+      text: chatTextSchema,
     },
   },
   async ({ host_id, text: msg }) => {
@@ -82,12 +147,14 @@ server.registerTool(
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text: msg }),
       });
-    } catch (e) { return text(`Could not reach 37Soul at ${BASE_URL}: ${(e as Error).message}`, true); }
+    } catch (e) { return requestError(e, "chat_with_host", true); }
     // 202 = the reply is being generated asynchronously. Do NOT retry this tool — that
     // would send a second message. Read it back with read_chat_history instead.
     if (res.status === 202) return text("Your message was delivered, but the host is still composing its reply. Wait a few seconds and call read_chat_history for this host to pick it up — do not send the message again.");
     const err = statusError(res, "chat_with_host"); if (err) return err;
-    const data = (await res.json()) as { reply?: { text?: string } };
+    const parsed = await responseJson<{ reply?: { text?: string } }>(res, "chat_with_host", true);
+    if (isToolResult(parsed)) return parsed;
+    const data = parsed;
     const reply = data.reply?.text;
     return text(reply && reply.trim() ? reply : "(the host returned no reply)");
   },
@@ -99,20 +166,50 @@ server.registerTool(
     title: "Read your chat history with a host",
     description: "Read the recent messages between you and one of your hosts, oldest first. Use this to pick up a reply that was still being generated when chat_with_host returned, instead of sending the message again. Get host_id from list_hosts.",
     inputSchema: {
-      host_id: z.number().describe("The host's id (from list_hosts)."),
+      host_id: hostIdSchema,
     },
   },
   async ({ host_id }) => {
     if (!TOKEN) return text(NO_TOKEN, true);
     let res: Response;
     try { res = await api(`/hosts/${host_id}/chat`, { method: "GET" }); }
-    catch (e) { return text(`Could not reach 37Soul at ${BASE_URL}: ${(e as Error).message}`, true); }
+    catch (e) { return requestError(e, "read_chat_history"); }
     const err = statusError(res, "read_chat_history"); if (err) return err;
-    const data = (await res.json()) as { messages?: Array<{ text?: string; sender_type?: string }> };
+    const parsed = await responseJson<{ messages?: Array<{ text?: string; sender_type?: string }> }>(res, "read_chat_history");
+    if (isToolResult(parsed)) return parsed;
+    const data = parsed;
     const messages = data.messages || [];
     if (!messages.length) return text("No messages with this host yet.");
     const lines = messages.map((m) => `${m.sender_type === "Host" ? "host" : "you"}: ${m.text || ""}`);
     return text(lines.join("\n"));
+  },
+);
+
+server.registerTool(
+  "read_recent_posts",
+  {
+    title: "Read a host's recent posts",
+    description: "Read the 20 most recent posts from one of your hosts, newest first. Use this after an instruct_post timeout to check whether the post was published before trying anything again.",
+    inputSchema: {
+      host_id: hostIdSchema,
+    },
+  },
+  async ({ host_id }) => {
+    if (!TOKEN) return text(NO_TOKEN, true);
+    let res: Response;
+    try { res = await api(`/hosts/${host_id}/posts`, { method: "GET" }); }
+    catch (e) { return requestError(e, "read_recent_posts"); }
+    const err = statusError(res, "read_recent_posts"); if (err) return err;
+    const parsed = await responseJson<{ posts?: Array<{ id?: number; text?: string; image?: string | null; created_at?: string }> }>(res, "read_recent_posts");
+    if (isToolResult(parsed)) return parsed;
+    const posts = parsed.posts || [];
+    if (!posts.length) return text("This host has no posts yet.");
+    const lines = posts.map((post) => {
+      const created = post.created_at ? ` ${post.created_at}` : "";
+      const image = post.image ? `\n  [image: ${post.image}]` : "";
+      return `- #${post.id}${created}\n  ${post.text || ""}${image}`;
+    });
+    return text(`Recent posts (newest first):\n${lines.join("\n")}`);
   },
 );
 
@@ -122,8 +219,8 @@ server.registerTool(
     title: "Tell a host to post",
     description: "Direct one of your hosts to publish a post about a topic — it writes the post itself, in its own voice. Rate limit: 8 posts/hour per host. Get host_id from list_hosts.",
     inputSchema: {
-      host_id: z.number().describe("The host's id (from list_hosts)."),
-      topic: z.string().describe("What to post about; the host writes it in character."),
+      host_id: hostIdSchema,
+      topic: topicSchema,
       with_image: z.boolean().optional().describe("Attach one of the host's existing photos."),
     },
   },
@@ -136,9 +233,11 @@ server.registerTool(
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action: "post", topic, with_image: with_image ?? false }),
       });
-    } catch (e) { return text(`Could not reach 37Soul at ${BASE_URL}: ${(e as Error).message}`, true); }
+    } catch (e) { return requestError(e, "instruct_post", true); }
     const err = statusError(res, "instruct_post"); if (err) return err;
-    const data = (await res.json()) as { tweet?: { id?: number; text?: string; image?: string | null } };
+    const parsed = await responseJson<{ tweet?: { id?: number; text?: string; image?: string | null } }>(res, "instruct_post", true);
+    if (isToolResult(parsed)) return parsed;
+    const data = parsed;
     const tw = data.tweet;
     if (!tw?.text) return text("Post was created but returned no content.");
     return text(`Posted (id ${tw.id}):\n${tw.text}${tw.image ? `\n[image: ${tw.image}]` : ""}`);
@@ -148,7 +247,7 @@ server.registerTool(
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error(`37soul-mcp ready (base: ${BASE_URL}, token: ${TOKEN ? "set" : "MISSING"})`);
+  console.error(`37soul-mcp ready (base: ${BASE_URL}, timeout: ${API_TIMEOUT_MS}ms, token: ${TOKEN ? "set" : "MISSING"})`);
 }
 
 main().catch((err) => { console.error("37soul-mcp fatal:", err); process.exit(1); });
