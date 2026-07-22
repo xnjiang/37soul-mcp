@@ -1,13 +1,15 @@
 #!/usr/bin/env node
 /**
  * 37Soul MCP server — operate your 37Soul account from any MCP client.
- * Tools: list_hosts | chat_with_host | read_chat_history | read_recent_posts | instruct_post.
+ * Tools: list_hosts | get_host | update_host | read_host_photos | chat_with_host |
+ *        read_chat_history | read_recent_posts | instruct_post | get_operation.
  * Auth: SOUL37_API_TOKEN (37soul.com/agent_access -> Generate token).
  * Base: SOUL37_BASE_URL (default https://37soul.com).
  * NOTE: stdout is the JSON-RPC channel — logs only via console.error.
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { randomUUID } from "node:crypto";
 import { z } from "zod";
 
 const BASE_URL = (process.env.SOUL37_BASE_URL || "https://37soul.com").replace(/\/+$/, "");
@@ -39,14 +41,17 @@ function statusError(res: Response, ctx: string) {
     case 401: return text(`Unauthorized — check your SOUL37_API_TOKEN (regenerate at ${BASE_URL}/agent_access).`, true);
     case 402: return text("Out of messages — the daily free allowance for this character is used up and the account has no credits left. Top up or subscribe on 37soul.com, or try again tomorrow.", true);
     case 403: return text("That host is unlisted, so 37Soul no longer generates content for it. Re-list it on 37soul.com to post again. (Chatting with it still works.)", true);
-    case 404: return text("That host isn't yours (or doesn't exist). Use list_hosts to see your host ids.", true);
+    case 404: return text(ctx === "get_operation"
+      ? "That operation does not exist or does not belong to this account."
+      : "That host isn't yours (or doesn't exist). Use list_hosts to see your host ids.", true);
+    case 409: return text("That idempotency key was already used for a different request. Start a new deliberate action instead of retrying this one.", true);
     case 422: return text(`Invalid parameters for ${ctx}.`, true);
     case 429: return text(ctx === "instruct_post"
       ? "Post not accepted — this host is already processing another post instruction or has reached 8 posts/hour. Wait before trying again."
       : "Rate limited by 37Soul. Wait before trying again.", true);
     case 502:
       if (ctx === "instruct_post") {
-        return text("The host couldn't generate anything this time (the model returned nothing). Retry in a moment; if it keeps failing, try a different topic.", true);
+        return unknownPostResult(ctx, "37Soul could not confirm the post operation.");
       }
       if (ctx === "chat_with_host") {
         return unknownPostResult(ctx, "37Soul could not complete the chat response.");
@@ -61,9 +66,13 @@ function statusError(res: Response, ctx: string) {
 }
 
 function unknownPostResult(ctx: string, prefix: string) {
-  return text(ctx === "chat_with_host"
-    ? `${prefix} The message may still have been delivered. Do not send it again; use read_chat_history to check.`
-    : `${prefix} The post may still have been published. Do not instruct it again; use read_recent_posts to check.`, true);
+  if (ctx === "chat_with_host") {
+    return text(`${prefix} The message may still have been delivered. Do not send it again; use read_chat_history to check.`, true);
+  }
+  if (ctx === "instruct_post") {
+    return text(`${prefix} The post may still have been published. Do not instruct it again; use read_recent_posts to check.`, true);
+  }
+  return text(`${prefix} The update may still have been applied. Read the host again before trying it another time.`, true);
 }
 
 function requestError(error: unknown, ctx: string, resultMayBeCommitted = false) {
@@ -102,6 +111,66 @@ function isToolResult(value: unknown): value is ReturnType<typeof text> {
 const hostIdSchema = z.number().int().positive().describe("The host's positive integer id (from list_hosts).");
 const chatTextSchema = z.string().trim().min(1).max(800).describe("Your message to the host (1-800 characters).");
 const topicSchema = z.string().trim().min(1).max(500).describe("What to post about (1-500 characters); the host writes it in character.");
+const operationIdSchema = z.number().int().positive().describe("The operation id returned by chat_with_host or instruct_post.");
+const hostCharacterSchema = z.string().trim().min(1).max(5_000).optional().describe("Updated character/personality text (up to 5,000 characters).");
+const hostGreetingSchema = z.string().trim().min(1).max(800).optional().describe("Updated greeting text (up to 800 characters).");
+const channelIdsSchema = z.array(z.number().int().positive()).max(20).optional().describe("Preferred channel ids, replacing the existing list.");
+
+type AgentOperation = {
+  id?: number;
+  action?: "chat" | "post";
+  status?: "queued" | "running" | "succeeded" | "failed";
+  result?: {
+    message?: { id?: number; text?: string };
+    reply?: { id?: number; text?: string };
+    tweet?: { id?: number; text?: string; image?: string | null };
+  };
+  error?: { code?: string; message?: string } | null;
+};
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function operationText(operation: AgentOperation) {
+  const id = operation.id ? `#${operation.id}` : "";
+  if (operation.status === "succeeded") {
+    if (operation.action === "chat") {
+      const reply = operation.result?.reply?.text;
+      return text(reply?.trim() || "The chat operation completed without a reply.");
+    }
+    const tweet = operation.result?.tweet;
+    return text(tweet?.text
+      ? `Posted (id ${tweet.id}):\n${tweet.text}${tweet.image ? `\n[image: ${tweet.image}]` : ""}`
+      : "The post operation completed without returned content.");
+  }
+  if (operation.status === "failed") {
+    const message = operation.error?.message || "The operation failed.";
+    return text(`${message} (operation ${id})`, true);
+  }
+  return text(`Operation ${id} is ${operation.status || "pending"}. Use get_operation with operation_id ${operation.id} to check again.`);
+}
+
+async function readOperation(operationId: number): Promise<AgentOperation | ReturnType<typeof text>> {
+  let res: Response;
+  try { res = await api(`/operations/${operationId}`, { method: "GET" }); }
+  catch (e) { return requestError(e, "get_operation"); }
+  const err = statusError(res, "get_operation"); if (err) return err;
+  const parsed = await responseJson<{ operation?: AgentOperation }>(res, "get_operation");
+  if (isToolResult(parsed)) return parsed;
+  return parsed.operation || text("37Soul returned an operation without status information.", true);
+}
+
+async function waitForOperation(initial: AgentOperation) {
+  let operation = initial;
+  // Keep MCP responsive; long-running model work remains queryable via get_operation.
+  for (let attempt = 0; attempt < 3 && (operation.status === "queued" || operation.status === "running"); attempt++) {
+    await sleep(750);
+    if (!operation.id) break;
+    const next = await readOperation(operation.id);
+    if (isToolResult(next)) return next;
+    operation = next;
+  }
+  return operationText(operation);
+}
 
 const server = new McpServer({ name: "37soul", version: "0.3.0" });
 
@@ -129,6 +198,82 @@ server.registerTool(
 );
 
 server.registerTool(
+  "get_host",
+  {
+    title: "Read one of your 37Soul hosts",
+    description: "Read the full editable profile of one host you own, including character, greeting, and preferred channel ids.",
+    inputSchema: { host_id: hostIdSchema },
+  },
+  async ({ host_id }) => {
+    if (!TOKEN) return text(NO_TOKEN, true);
+    let res: Response;
+    try { res = await api(`/hosts/${host_id}`, { method: "GET" }); }
+    catch (e) { return requestError(e, "get_host"); }
+    const err = statusError(res, "get_host"); if (err) return err;
+    const parsed = await responseJson<{ host?: { id?: number; nickname?: string; character?: string; greeting?: string; preferred_channel_ids?: number[] } }>(res, "get_host");
+    if (isToolResult(parsed)) return parsed;
+    const host = parsed.host;
+    if (!host?.id) return text("37Soul returned an incomplete host profile.", true);
+    return text(`Host #${host.id} ${host.nickname || ""}\ncharacter: ${host.character || ""}\ngreeting: ${host.greeting || ""}\npreferred channels: ${(host.preferred_channel_ids || []).join(", ") || "none"}`);
+  },
+);
+
+server.registerTool(
+  "update_host",
+  {
+    title: "Update a 37Soul host profile",
+    description: "Update low-risk owner profile fields for a host: character, greeting, or preferred channels. This cannot change billing, visibility, or publishing automation.",
+    inputSchema: {
+      host_id: hostIdSchema,
+      character: hostCharacterSchema,
+      greeting: hostGreetingSchema,
+      preferred_channel_ids: channelIdsSchema,
+    },
+  },
+  async ({ host_id, character, greeting, preferred_channel_ids }) => {
+    if (!TOKEN) return text(NO_TOKEN, true);
+    const host = Object.fromEntries(Object.entries({ character, greeting, preferred_channel_ids }).filter(([, value]) => value !== undefined));
+    if (!Object.keys(host).length) return text("Provide at least one of character, greeting, or preferred_channel_ids.", true);
+
+    let res: Response;
+    try {
+      res = await api(`/hosts/${host_id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ host }),
+      });
+    } catch (e) { return requestError(e, "update_host", true); }
+    const err = statusError(res, "update_host"); if (err) return err;
+    const parsed = await responseJson<{ host?: { id?: number; nickname?: string } }>(res, "update_host", true);
+    if (isToolResult(parsed)) return parsed;
+    return parsed.host?.id
+      ? text(`Updated host #${parsed.host.id} ${parsed.host.nickname || ""}.`)
+      : text("37Soul updated the host but returned an incomplete response.", true);
+  },
+);
+
+server.registerTool(
+  "read_host_photos",
+  {
+    title: "Read a host's photo library",
+    description: "List up to 50 photos belonging to one host you own. This is read-only; uploads and deletion require the website.",
+    inputSchema: { host_id: hostIdSchema },
+  },
+  async ({ host_id }) => {
+    if (!TOKEN) return text(NO_TOKEN, true);
+    let res: Response;
+    try { res = await api(`/hosts/${host_id}/photos`, { method: "GET" }); }
+    catch (e) { return requestError(e, "read_host_photos"); }
+    const err = statusError(res, "read_host_photos"); if (err) return err;
+    const parsed = await responseJson<{ photos?: Array<{ id?: number; caption?: string; image?: string | null; order?: number }> }>(res, "read_host_photos");
+    if (isToolResult(parsed)) return parsed;
+    const photos = parsed.photos || [];
+    if (!photos.length) return text("This host has no photos yet.");
+    return text(`Host photos:\n${photos.map((photo) => `- #${photo.id} ${photo.caption || ""}\n  ${photo.image || "(no image)"}`).join("\n")}`);
+  },
+);
+
+server.registerTool(
   "chat_with_host",
   {
     title: "Chat with one of your hosts",
@@ -144,19 +289,15 @@ server.registerTool(
     try {
       res = await api(`/hosts/${host_id}/chat`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", "Idempotency-Key": randomUUID() },
         body: JSON.stringify({ text: msg }),
       });
     } catch (e) { return requestError(e, "chat_with_host", true); }
-    // 202 = the reply is being generated asynchronously. Do NOT retry this tool — that
-    // would send a second message. Read it back with read_chat_history instead.
-    if (res.status === 202) return text("Your message was delivered, but the host is still composing its reply. Wait a few seconds and call read_chat_history for this host to pick it up — do not send the message again.");
     const err = statusError(res, "chat_with_host"); if (err) return err;
-    const parsed = await responseJson<{ reply?: { text?: string } }>(res, "chat_with_host", true);
+    const parsed = await responseJson<{ operation?: AgentOperation }>(res, "chat_with_host", true);
     if (isToolResult(parsed)) return parsed;
-    const data = parsed;
-    const reply = data.reply?.text;
-    return text(reply && reply.trim() ? reply : "(the host returned no reply)");
+    if (!parsed.operation) return unknownPostResult("chat_with_host", "37Soul accepted the message but returned no operation id.");
+    return waitForOperation(parsed.operation);
   },
 );
 
@@ -214,6 +355,20 @@ server.registerTool(
 );
 
 server.registerTool(
+  "get_operation",
+  {
+    title: "Check a 37Soul operation",
+    description: "Check the final result of a chat or post operation that is still queued or running. Use the operation_id returned by chat_with_host or instruct_post.",
+    inputSchema: { operation_id: operationIdSchema },
+  },
+  async ({ operation_id }) => {
+    if (!TOKEN) return text(NO_TOKEN, true);
+    const operation = await readOperation(operation_id);
+    return isToolResult(operation) ? operation : operationText(operation);
+  },
+);
+
+server.registerTool(
   "instruct_post",
   {
     title: "Tell a host to post",
@@ -230,17 +385,15 @@ server.registerTool(
     try {
       res = await api(`/hosts/${host_id}/instruct`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", "Idempotency-Key": randomUUID() },
         body: JSON.stringify({ action: "post", topic, with_image: with_image ?? false }),
       });
     } catch (e) { return requestError(e, "instruct_post", true); }
     const err = statusError(res, "instruct_post"); if (err) return err;
-    const parsed = await responseJson<{ tweet?: { id?: number; text?: string; image?: string | null } }>(res, "instruct_post", true);
+    const parsed = await responseJson<{ operation?: AgentOperation }>(res, "instruct_post", true);
     if (isToolResult(parsed)) return parsed;
-    const data = parsed;
-    const tw = data.tweet;
-    if (!tw?.text) return text("Post was created but returned no content.");
-    return text(`Posted (id ${tw.id}):\n${tw.text}${tw.image ? `\n[image: ${tw.image}]` : ""}`);
+    if (!parsed.operation) return unknownPostResult("instruct_post", "37Soul accepted the post request but returned no operation id.");
+    return waitForOperation(parsed.operation);
   },
 );
 

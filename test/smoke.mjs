@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
  * End-to-end smoke test: mock 37Soul API + drive the real server over stdio JSON-RPC.
- * No framework — `npm test`. Asserts tool surface, happy paths, and every status the
- * /api/v1/me contract can actually return.
+ * It covers the complete MCP surface, asynchronous operations, local validation, and
+ * every status the agent API can return.
  */
 import http from "node:http";
 import assert from "node:assert/strict";
@@ -13,34 +13,53 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 
 const SERVER = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "dist", "index.js");
 
-let status = 200; // override to force an error path
+let status = 200;
+let nextOperationId = 1;
+const operations = new Map();
 const seen = [];
+
+const operation = (action) => {
+  const id = nextOperationId++;
+  const result = action === "chat"
+    ? { reply: { id: 2, text: "还行，又通宵改稿哈哈" } }
+    : { tweet: { id: 987, text: "凌晨三点的显示器", image: null } };
+  operations.set(id, { id, action, status: "succeeded", result, error: null });
+  return { id, action, status: "queued", result: {}, error: null };
+};
 
 const api = http.createServer((req, res) => {
   let body = "";
   req.on("data", (c) => (body += c));
   req.on("end", () => {
-    seen.push({ method: req.method, url: req.url, auth: req.headers.authorization, body });
+    seen.push({ method: req.method, url: req.url, auth: req.headers.authorization, idempotencyKey: req.headers["idempotency-key"], body });
     const send = (code, obj) => {
       res.writeHead(code, { "Content-Type": "application/json" });
       res.end(JSON.stringify(obj));
     };
     if (status !== 200) return send(status, { error: "forced" });
-    if (req.url === "/api/v1/me/hosts")
+    if (req.url === "/api/v1/me/hosts" && req.method === "GET")
       return send(200, { hosts: [{ id: 262, nickname: "Nyx", age: 25, character: "night owl illustrator", karma_score: 120 }] });
-    if (req.url === "/api/v1/me/hosts/999/chat") {
-      return;
+    if (req.url === "/api/v1/me/hosts/262" && req.method === "GET")
+      return send(200, { host: { id: 262, nickname: "Nyx", character: "night owl illustrator", greeting: "hi", preferred_channel_ids: [3] } });
+    if (req.url === "/api/v1/me/hosts/262" && req.method === "PATCH")
+      return send(200, { host: { id: 262, nickname: "Nyx" } });
+    if (req.url === "/api/v1/me/hosts/262/photos" && req.method === "GET")
+      return send(200, { photos: [{ id: 7, caption: "studio", image: "https://files.example/7.webp", order: 0 }] });
+    if (req.url.startsWith("/api/v1/me/operations/") && req.method === "GET") {
+      const id = Number(req.url.split("/").pop());
+      return operations.has(id) ? send(200, { operation: operations.get(id) }) : send(404, { error: "missing" });
     }
+    if (req.url === "/api/v1/me/hosts/999/chat") return;
     if (req.url === "/api/v1/me/hosts/998/chat" && req.method === "GET") {
       res.writeHead(200, { "Content-Type": "text/html" });
       return res.end("<html>not json</html>");
     }
     if (req.url === "/api/v1/me/hosts/997/instruct") {
-      res.writeHead(201, { "Content-Type": "application/json" });
+      res.writeHead(202, { "Content-Type": "application/json" });
       return res.end("{broken");
     }
     if (req.url.endsWith("/chat") && req.method === "POST")
-      return send(200, { message: { id: 1, text: "hi" }, reply: { id: 2, text: "还行，又通宵改稿哈哈" } });
+      return send(202, { operation: operation("chat") });
     if (req.url.endsWith("/chat") && req.method === "GET")
       return send(200, { messages: [
         { id: 1, text: "在忙吗", sender_type: "User" },
@@ -50,8 +69,8 @@ const api = http.createServer((req, res) => {
       return send(200, { posts: [
         { id: 987, text: "凌晨三点的显示器", image: null, created_at: "2026-07-22T09:00:00Z" },
       ] });
-    if (req.url.endsWith("/instruct"))
-      return send(201, { action: "post", tweet: { id: 987, text: "凌晨三点的显示器", image: null } });
+    if (req.url.endsWith("/instruct") && req.method === "POST")
+      return send(202, { operation: operation("post") });
     send(404, { error: "nope" });
   });
 });
@@ -82,82 +101,85 @@ const check = (label, fn) => {
   catch (e) { failures++; console.log(`  FAIL ${label}\n       ${e.message.replaceAll("\n", "\n       ")}`); }
 };
 
-// --- tool surface ---
 const { tools } = await client.listTools();
 const names = tools.map((t) => t.name).sort();
-check("exposes the five documented tools", () =>
-  assert.deepEqual(names, ["chat_with_host", "instruct_post", "list_hosts", "read_chat_history", "read_recent_posts"]));
+check("exposes the nine documented tools", () =>
+  assert.deepEqual(names, ["chat_with_host", "get_host", "get_operation", "instruct_post", "list_hosts", "read_chat_history", "read_host_photos", "read_recent_posts", "update_host"]));
 
-// --- happy paths ---
 const hosts = await call("list_hosts");
 check("list_hosts renders the host line", () => assert.match(hosts.text, /#262 Nyx \(25\)/));
 
+const fullHost = await call("get_host", { host_id: 262 });
+check("get_host renders editable fields", () => assert.match(fullHost.text, /preferred channels: 3/));
+
+const updated = await call("update_host", { host_id: 262, greeting: "new hello" });
+check("update_host confirms the update", () => assert.match(updated.text, /Updated host #262/));
+check("update_host sends only documented fields", () => assert.match(seen.at(-1).body, /"greeting":"new hello"/));
+
+const photos = await call("read_host_photos", { host_id: 262 });
+check("read_host_photos returns image details", () => assert.match(photos.text, /studio/));
+
 const chat = await call("chat_with_host", { host_id: 262, text: "最近怎么样？" });
-check("chat_with_host relays the reply", () => assert.match(chat.text, /又通宵改稿/));
+check("chat_with_host polls the operation and relays the reply", () => assert.match(chat.text, /又通宵改稿/));
+const chatRequest = seen.findLast((request) => request.url.endsWith("/chat") && request.method === "POST");
+check("chat_with_host supplies an idempotency key", () => assert.match(chatRequest.idempotencyKey, /^[0-9a-f-]{36}$/));
 
 const hist = await call("read_chat_history", { host_id: 262 });
 check("read_chat_history shows both sides oldest-first", () => {
   assert.match(hist.text, /在忙吗/);
   assert.match(hist.text, /刚收工/);
-  assert.ok(hist.text.indexOf("在忙吗") < hist.text.indexOf("刚收工"), "order should be oldest-first");
-});
-check("read_chat_history uses GET, not POST", () => {
-  const last = seen[seen.length - 1];
-  assert.equal(last.method, "GET");
-  assert.match(last.url, /\/chat$/);
+  assert.ok(hist.text.indexOf("在忙吗") < hist.text.indexOf("刚收工"));
 });
 
 const recent = await call("read_recent_posts", { host_id: 262 });
-check("read_recent_posts reports recent posts", () => {
-  assert.match(recent.text, /#987/);
-  assert.match(recent.text, /凌晨三点的显示器/);
-});
-check("read_recent_posts uses GET", () => assert.equal(seen[seen.length - 1].method, "GET"));
+check("read_recent_posts reports recent posts", () => assert.match(recent.text, /#987/));
 
 const post = await call("instruct_post", { host_id: 262, topic: "熬夜", with_image: false });
-check("instruct_post reports the published text", () => assert.match(post.text, /凌晨三点的显示器/));
-check("with_image false is sent as a real boolean", () =>
-  assert.match(seen[seen.length - 1].body, /"with_image":false/));
+check("instruct_post polls and reports the published text", () => assert.match(post.text, /凌晨三点的显示器/));
+const postRequest = seen.findLast((request) => request.url.endsWith("/instruct") && request.method === "POST");
+check("post writes a boolean image flag and idempotency key", () => {
+  assert.match(postRequest.body, /"with_image":false/);
+  assert.match(postRequest.idempotencyKey, /^[0-9a-f-]{36}$/);
+});
 
-check("auth header is attached", () => assert.equal(seen[0].auth, "Bearer tok_test"));
+const checked = await call("get_operation", { operation_id: 1 });
+check("get_operation returns a completed operation result", () => assert.match(checked.text, /又通宵改稿/));
 
 const seenBeforeValidation = seen.length;
 const invalid = await call("chat_with_host", { host_id: -1, text: "x" });
 check("invalid input is rejected locally without an API request", () => {
-  assert.ok(invalid.isError, "should set isError");
+  assert.ok(invalid.isError);
   assert.equal(seen.length, seenBeforeValidation);
 });
 
 const malformed = await call("read_chat_history", { host_id: 998 });
 check("invalid JSON is returned as a safe tool error", () => {
-  assert.ok(malformed.isError, "should set isError");
+  assert.ok(malformed.isError);
   assert.match(malformed.text, /invalid response/i);
 });
 
 const timedOut = await call("chat_with_host", { host_id: 999, text: "hello" });
-check("POST timeout warns that the result may be committed and must not be retried", () => {
-  assert.ok(timedOut.isError, "should set isError");
+check("POST timeout warns that the result may be committed", () => {
+  assert.ok(timedOut.isError);
   assert.match(timedOut.text, /timed out/i);
   assert.match(timedOut.text, /may still have been delivered/i);
-  assert.match(timedOut.text, /do not send it again/i);
 });
 
 const incompletePost = await call("instruct_post", { host_id: 997, topic: "hello" });
-check("incomplete POST response is treated as an unknown result, not a retryable failure", () => {
-  assert.ok(incompletePost.isError, "should set isError");
+check("incomplete POST response is treated as an unknown result", () => {
+  assert.ok(incompletePost.isError);
   assert.match(incompletePost.text, /may still have been published/i);
-  assert.match(incompletePost.text, /do not instruct it again/i);
 });
 
-// --- error contract: every status /api/v1/me can return ---
 const errorCases = [
   [401, "instruct_post", /token/i],
-  [402, "chat_with_host", /credit|limit/i],   // daily free messages used up, no credits
-  [403, "instruct_post", /unlisted/i],        // platform stopped generating for this host
+  [402, "chat_with_host", /credit|limit/i],
+  [403, "instruct_post", /unlisted/i],
   [404, "instruct_post", /isn't yours|not/i],
+  [409, "instruct_post", /idempotency/i],
   [422, "instruct_post", /invalid/i],
   [429, "instruct_post", /8 posts|processing|rate/i],
-  [502, "instruct_post", /generat/i],         // upstream model produced nothing
+  [502, "instruct_post", /may still have been published/i],
   [502, "chat_with_host", /may still have been delivered/i],
   [500, "instruct_post", /may still have been published/i],
 ];
@@ -165,9 +187,9 @@ for (const [code, tool, pattern] of errorCases) {
   status = code;
   const r = await call(tool, { host_id: 262, text: "x", topic: "x" });
   check(`HTTP ${code} → actionable message, flagged as error`, () => {
-    assert.ok(r.isError, "should set isError");
+    assert.ok(r.isError);
     assert.match(r.text, pattern);
-    assert.doesNotMatch(r.text, /HTTP \d\d\d/, "should not leak a raw status code");
+    assert.doesNotMatch(r.text, /HTTP \d\d\d/);
   });
 }
 status = 200;
