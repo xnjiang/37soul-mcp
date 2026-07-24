@@ -6,6 +6,8 @@
  */
 import http from "node:http";
 import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -16,14 +18,20 @@ const SERVER = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "di
 let status = 200;
 let nextOperationId = 1;
 const operations = new Map();
+const operationsByKey = new Map();
 const seen = [];
 
-const operation = (action) => {
+const operation = (action, idempotencyKey) => {
+  const existing = operationsByKey.get(`${action}:${idempotencyKey}`);
+  if (existing) return { id: existing.id, action, status: "queued", result: {}, error: null };
+
   const id = nextOperationId++;
   const result = action === "chat"
     ? { reply: { id: 2, text: "还行，又通宵改稿哈哈" } }
     : { tweet: { id: 987, text: "凌晨三点的显示器", image: null } };
-  operations.set(id, { id, action, status: "succeeded", result, error: null });
+  const created = { id, action, status: "succeeded", result, error: null };
+  operations.set(id, created);
+  operationsByKey.set(`${action}:${idempotencyKey}`, created);
   return { id, action, status: "queued", result: {}, error: null };
 };
 
@@ -36,6 +44,7 @@ const api = http.createServer((req, res) => {
       res.writeHead(code, { "Content-Type": "application/json" });
       res.end(JSON.stringify(obj));
     };
+    if (req.headers.authorization !== "Bearer tok_test") return send(401, { error: "unauthorized" });
     if (status !== 200) return send(status, { error: "forced" });
     if (req.url === "/api/v1/me/hosts" && req.method === "GET")
       return send(200, { hosts: [{ id: 262, nickname: "Nyx", age: 25, character: "night owl illustrator", karma_score: 120 }] });
@@ -59,7 +68,7 @@ const api = http.createServer((req, res) => {
       return res.end("{broken");
     }
     if (req.url.endsWith("/chat") && req.method === "POST")
-      return send(202, { operation: operation("chat") });
+      return send(202, { operation: operation("chat", String(req.headers["idempotency-key"])) });
     if (req.url.endsWith("/chat") && req.method === "GET")
       return send(200, { messages: [
         { id: 1, text: "在忙吗", sender_type: "User" },
@@ -70,25 +79,34 @@ const api = http.createServer((req, res) => {
         { id: 987, text: "凌晨三点的显示器", image: null, created_at: "2026-07-22T09:00:00Z" },
       ] });
     if (req.url.endsWith("/instruct") && req.method === "POST")
-      return send(202, { operation: operation("post") });
+      return send(202, { operation: operation("post", String(req.headers["idempotency-key"])) });
     send(404, { error: "nope" });
   });
 });
 await new Promise((r) => api.listen(0, r));
 const port = api.address().port;
+const stateDirectory = mkdtempSync(path.join(tmpdir(), "37soul-mcp-smoke-"));
+const statePath = path.join(stateDirectory, "operations.json");
+const serverEnv = {
+  ...process.env,
+  SOUL_API_TOKEN: "tok_test", // Compatibility alias used by prior skill installs.
+  SOUL37_BASE_URL: `http://127.0.0.1:${port}/`,
+  SOUL37_API_TIMEOUT_MS: "1000",
+  SOUL37_OPERATION_STATE_PATH: statePath,
+};
 
-const client = new Client({ name: "smoke", version: "1" });
-await client.connect(new StdioClientTransport({
-  command: "node",
-  args: [SERVER],
-  env: {
-    ...process.env,
-    SOUL37_API_TOKEN: "tok_test",
-    SOUL37_BASE_URL: `http://127.0.0.1:${port}/`,
-    SOUL37_API_TIMEOUT_MS: "1000",
-  },
-  stderr: "ignore",
-}));
+const connectClient = async (name) => {
+  const client = new Client({ name, version: "1" });
+  await client.connect(new StdioClientTransport({
+    command: "node",
+    args: [SERVER],
+    env: serverEnv,
+    stderr: "ignore",
+  }));
+  return client;
+};
+
+const client = await connectClient("smoke");
 
 const call = async (name, args = {}) => {
   const r = await client.callTool({ name, arguments: args });
@@ -108,6 +126,8 @@ check("exposes the nine documented tools", () =>
 
 const hosts = await call("list_hosts");
 check("list_hosts renders the host line", () => assert.match(hosts.text, /#262 Nyx \(25\)/));
+check("legacy SOUL_API_TOKEN alias authenticates requests", () =>
+  assert.equal(seen.at(-1).auth, "Bearer tok_test"));
 
 const fullHost = await call("get_host", { host_id: 262 });
 check("get_host renders editable fields", () => assert.match(fullHost.text, /preferred channels: 3/));
@@ -123,6 +143,24 @@ const chat = await call("chat_with_host", { host_id: 262, text: "最近怎么样
 check("chat_with_host polls the operation and relays the reply", () => assert.match(chat.text, /又通宵改稿/));
 const chatRequest = seen.findLast((request) => request.url.endsWith("/chat") && request.method === "POST");
 check("chat_with_host supplies an idempotency key", () => assert.match(chatRequest.idempotencyKey, /^[0-9a-f-]{36}$/));
+const retriedChat = await call("chat_with_host", { host_id: 262, text: "最近怎么样？" });
+check("a repeated chat intent reuses its idempotency key", () => {
+  assert.match(retriedChat.text, /又通宵改稿/);
+  const chatRequests = seen.filter((request) => request.url.endsWith("/chat") && request.method === "POST");
+  assert.equal(chatRequests.at(-1).idempotencyKey, chatRequests.at(-2).idempotencyKey);
+  assert.equal(operations.size, 1);
+});
+const deliberateRepeat = await call("chat_with_host", { host_id: 262, text: "最近怎么样？", new_intent: true });
+check("new_intent deliberately creates a new chat operation", () => {
+  assert.match(deliberateRepeat.text, /又通宵改稿/);
+  const chatRequests = seen.filter((request) => request.url.endsWith("/chat") && request.method === "POST");
+  assert.notEqual(chatRequests.at(-1).idempotencyKey, chatRequests.at(-2).idempotencyKey);
+  assert.equal(operations.size, 2);
+});
+check("the durable idempotency ledger stores neither token nor message text", () => {
+  const ledger = readFileSync(statePath, "utf8");
+  assert.doesNotMatch(ledger, /tok_test|最近怎么样/);
+});
 
 const hist = await call("read_chat_history", { host_id: 262 });
 check("read_chat_history shows both sides oldest-first", () => {
@@ -195,7 +233,20 @@ for (const [code, tool, pattern] of errorCases) {
 status = 200;
 
 await client.close();
+const restartedClient = await connectClient("restart");
+const restartedRetry = await restartedClient.callTool({
+  name: "chat_with_host",
+  arguments: { host_id: 262, text: "最近怎么样？" },
+});
+check("the idempotency ledger survives an MCP restart", () => {
+  assert.match(restartedRetry.content[0].text, /又通宵改稿/);
+  const chatRequests = seen.filter((request) => request.url.endsWith("/chat") && request.method === "POST");
+  assert.equal(chatRequests.at(-1).idempotencyKey, chatRequests.at(-2).idempotencyKey);
+  assert.equal(operations.size, 3);
+});
+await restartedClient.close();
 api.close();
+rmSync(stateDirectory, { recursive: true, force: true });
 
 console.log(failures ? `\n${failures} check(s) failed` : "\nall checks passed");
 process.exit(failures ? 1 : 0);

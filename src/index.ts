@@ -3,37 +3,129 @@
  * 37Soul MCP server — operate your 37Soul account from any MCP client.
  * Tools: list_hosts | get_host | update_host | read_host_photos | chat_with_host |
  *        read_chat_history | read_recent_posts | instruct_post | get_operation.
- * Auth: SOUL37_API_TOKEN (37soul.com/agent_access -> Generate token).
+ * Auth: SOUL37_API_TOKEN (SOUL_API_TOKEN remains a compatibility alias).
  * Base: SOUL37_BASE_URL (default https://37soul.com).
  * NOTE: stdout is the JSON-RPC channel — logs only via console.error.
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import { z } from "zod";
 
 const BASE_URL = (process.env.SOUL37_BASE_URL || "https://37soul.com").replace(/\/+$/, "");
-const TOKEN = process.env.SOUL37_API_TOKEN || "";
+const TOKEN = process.env.SOUL37_API_TOKEN || process.env.SOUL_API_TOKEN || "";
 const configuredTimeout = Number.parseInt(process.env.SOUL37_API_TIMEOUT_MS || "", 10);
 const API_TIMEOUT_MS = Number.isFinite(configuredTimeout) && configuredTimeout >= 1_000
   ? Math.min(configuredTimeout, 300_000)
-  : 90_000;
+  : 20_000;
+const POLL_REQUEST_TIMEOUT_MS = Math.min(API_TIMEOUT_MS, 2_000);
+const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1_000;
+const OPERATION_STATE_PATH = process.env.SOUL37_OPERATION_STATE_PATH
+  || join(process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "37soul-mcp", "operations.json");
+const MCP_VERSION = "0.4.2";
+
+type OperationLedgerEntry = {
+  idempotencyKey: string;
+  createdAt: number;
+  operationId?: number;
+};
+
+type OperationLedger = Record<string, OperationLedgerEntry>;
+
+function loadOperationLedger(): OperationLedger {
+  try {
+    const parsed = JSON.parse(readFileSync(OPERATION_STATE_PATH, "utf8")) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return Object.fromEntries(Object.entries(parsed).filter(([, entry]) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
+      const candidate = entry as Partial<OperationLedgerEntry>;
+      return typeof candidate.idempotencyKey === "string" && typeof candidate.createdAt === "number";
+    })) as OperationLedger;
+  } catch {
+    return {};
+  }
+}
+
+const operationLedger = loadOperationLedger();
+
+function pruneOperationLedger(now = Date.now()) {
+  for (const [fingerprint, entry] of Object.entries(operationLedger)) {
+    if (now - entry.createdAt > IDEMPOTENCY_TTL_MS) delete operationLedger[fingerprint];
+  }
+}
+
+function persistOperationLedger() {
+  try {
+    pruneOperationLedger();
+    mkdirSync(dirname(OPERATION_STATE_PATH), { recursive: true, mode: 0o700 });
+    const temporaryPath = `${OPERATION_STATE_PATH}.${process.pid}.${randomUUID()}.tmp`;
+    writeFileSync(temporaryPath, JSON.stringify(operationLedger), { mode: 0o600 });
+    renameSync(temporaryPath, OPERATION_STATE_PATH);
+  } catch (error) {
+    // An unreadable local state directory must not block a creator action. The process
+    // still preserves retries for its lifetime, and stderr stays off the MCP channel.
+    console.error(`37soul-mcp could not persist its idempotency ledger: ${error instanceof Error ? error.message : "unknown error"}`);
+  }
+}
+
+function intentFingerprint(action: "chat" | "post", hostId: number, payload: Record<string, unknown>) {
+  // The ledger never stores the token or user content. Including their digests scopes
+  // a reused key to this account, host, action, and exact normalized request.
+  return createHash("sha256")
+    .update(JSON.stringify({
+      baseUrl: BASE_URL,
+      token: createHash("sha256").update(TOKEN).digest("hex"),
+      action,
+      hostId,
+      payload,
+    }))
+    .digest("hex");
+}
+
+function idempotencyForIntent(
+  action: "chat" | "post",
+  hostId: number,
+  payload: Record<string, unknown>,
+  explicitKey?: string,
+  newIntent = false,
+) {
+  if (explicitKey) return { idempotencyKey: explicitKey, fingerprint: null };
+
+  const fingerprint = intentFingerprint(action, hostId, payload);
+  pruneOperationLedger();
+  const existing = operationLedger[fingerprint];
+  if (existing && !newIntent) return { idempotencyKey: existing.idempotencyKey, fingerprint };
+
+  const entry = { idempotencyKey: randomUUID(), createdAt: Date.now() };
+  operationLedger[fingerprint] = entry;
+  persistOperationLedger();
+  return { idempotencyKey: entry.idempotencyKey, fingerprint };
+}
+
+function rememberOperation(fingerprint: string | null, operationId?: number) {
+  if (!fingerprint || !operationId || !operationLedger[fingerprint]) return;
+  operationLedger[fingerprint].operationId = operationId;
+  persistOperationLedger();
+}
 
 function text(t: string, isError = false) {
   return { content: [{ type: "text" as const, text: t }], ...(isError ? { isError: true } : {}) };
 }
 
-async function api(path: string, init: RequestInit = {}): Promise<Response> {
+async function api(path: string, init: RequestInit = {}, timeoutMs = API_TIMEOUT_MS): Promise<Response> {
   const headers = new Headers(init.headers);
   headers.set("Authorization", `Bearer ${TOKEN}`);
   return fetch(`${BASE_URL}/api/v1/me${path}`, {
     ...init,
     headers,
-    signal: init.signal || AbortSignal.timeout(API_TIMEOUT_MS),
+    signal: init.signal || AbortSignal.timeout(timeoutMs),
   });
 }
 
-const NO_TOKEN = `SOUL37_API_TOKEN is not set. Get a token at ${BASE_URL}/agent_access (log in -> Generate token — one token covers all your hosts), then set it in this MCP server's env.`;
+const NO_TOKEN = `SOUL37_API_TOKEN is not set. Get a token at ${BASE_URL}/agent_access (log in -> Generate token — one token covers all your hosts), then set it in this MCP server's env. SOUL_API_TOKEN is accepted only as a compatibility alias.`;
 
 function statusError(res: Response, ctx: string) {
   if (res.ok) return null;
@@ -112,9 +204,11 @@ const hostIdSchema = z.number().int().positive().describe("The host's positive i
 const chatTextSchema = z.string().trim().min(1).max(800).describe("Your message to the host (1-800 characters).");
 const topicSchema = z.string().trim().min(1).max(500).describe("What to post about (1-500 characters); the host writes it in character.");
 const operationIdSchema = z.number().int().positive().describe("The operation id returned by chat_with_host or instruct_post.");
-const hostCharacterSchema = z.string().trim().min(1).max(5_000).optional().describe("Updated character/personality text (up to 5,000 characters).");
-const hostGreetingSchema = z.string().trim().min(1).max(800).optional().describe("Updated greeting text (up to 800 characters).");
+const hostCharacterSchema = z.string().trim().min(1).max(1_000).optional().describe("Updated character/personality text (up to 1,000 characters).");
+const hostGreetingSchema = z.string().trim().max(800).optional().describe("Updated greeting text (up to 800 characters; use an empty string to clear it).");
 const channelIdsSchema = z.array(z.number().int().positive()).max(20).optional().describe("Preferred channel ids, replacing the existing list.");
+const idempotencyKeySchema = z.string().trim().min(1).max(128).optional().describe("Optional stable key for an external retry. Leave unset for MCP-managed idempotency.");
+const newIntentSchema = z.boolean().optional().describe("Set true only to deliberately send the same text or topic again; normal retries reuse the prior operation for 24 hours.");
 
 type AgentOperation = {
   id?: number;
@@ -149,9 +243,9 @@ function operationText(operation: AgentOperation) {
   return text(`Operation ${id} is ${operation.status || "pending"}. Use get_operation with operation_id ${operation.id} to check again.`);
 }
 
-async function readOperation(operationId: number): Promise<AgentOperation | ReturnType<typeof text>> {
+async function readOperation(operationId: number, timeoutMs = API_TIMEOUT_MS): Promise<AgentOperation | ReturnType<typeof text>> {
   let res: Response;
-  try { res = await api(`/operations/${operationId}`, { method: "GET" }); }
+  try { res = await api(`/operations/${operationId}`, { method: "GET" }, timeoutMs); }
   catch (e) { return requestError(e, "get_operation"); }
   const err = statusError(res, "get_operation"); if (err) return err;
   const parsed = await responseJson<{ operation?: AgentOperation }>(res, "get_operation");
@@ -165,14 +259,14 @@ async function waitForOperation(initial: AgentOperation) {
   for (let attempt = 0; attempt < 3 && (operation.status === "queued" || operation.status === "running"); attempt++) {
     await sleep(750);
     if (!operation.id) break;
-    const next = await readOperation(operation.id);
+    const next = await readOperation(operation.id, POLL_REQUEST_TIMEOUT_MS);
     if (isToolResult(next)) return next;
     operation = next;
   }
   return operationText(operation);
 }
 
-const server = new McpServer({ name: "37soul", version: "0.3.0" });
+const server = new McpServer({ name: "37soul", version: MCP_VERSION });
 
 server.registerTool(
   "list_hosts",
@@ -281,22 +375,28 @@ server.registerTool(
     inputSchema: {
       host_id: hostIdSchema,
       text: chatTextSchema,
+      idempotency_key: idempotencyKeySchema,
+      new_intent: newIntentSchema,
     },
   },
-  async ({ host_id, text: msg }) => {
+  async ({ host_id, text: msg, idempotency_key, new_intent }) => {
     if (!TOKEN) return text(NO_TOKEN, true);
+    if (idempotency_key && new_intent) return text("Use either idempotency_key for an external retry or new_intent for a deliberate repeat, not both.", true);
+    const payload = { text: msg };
+    const idempotency = idempotencyForIntent("chat", host_id, payload, idempotency_key, new_intent);
     let res: Response;
     try {
       res = await api(`/hosts/${host_id}/chat`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "Idempotency-Key": randomUUID() },
-        body: JSON.stringify({ text: msg }),
+        headers: { "Content-Type": "application/json", "Idempotency-Key": idempotency.idempotencyKey },
+        body: JSON.stringify(payload),
       });
     } catch (e) { return requestError(e, "chat_with_host", true); }
     const err = statusError(res, "chat_with_host"); if (err) return err;
     const parsed = await responseJson<{ operation?: AgentOperation }>(res, "chat_with_host", true);
     if (isToolResult(parsed)) return parsed;
     if (!parsed.operation) return unknownPostResult("chat_with_host", "37Soul accepted the message but returned no operation id.");
+    rememberOperation(idempotency.fingerprint, parsed.operation.id);
     return waitForOperation(parsed.operation);
   },
 );
@@ -377,22 +477,28 @@ server.registerTool(
       host_id: hostIdSchema,
       topic: topicSchema,
       with_image: z.boolean().optional().describe("Attach one of the host's existing photos."),
+      idempotency_key: idempotencyKeySchema,
+      new_intent: newIntentSchema,
     },
   },
-  async ({ host_id, topic, with_image }) => {
+  async ({ host_id, topic, with_image, idempotency_key, new_intent }) => {
     if (!TOKEN) return text(NO_TOKEN, true);
+    if (idempotency_key && new_intent) return text("Use either idempotency_key for an external retry or new_intent for a deliberate repeat, not both.", true);
+    const payload = { action: "post", topic, with_image: with_image ?? false };
+    const idempotency = idempotencyForIntent("post", host_id, payload, idempotency_key, new_intent);
     let res: Response;
     try {
       res = await api(`/hosts/${host_id}/instruct`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "Idempotency-Key": randomUUID() },
-        body: JSON.stringify({ action: "post", topic, with_image: with_image ?? false }),
+        headers: { "Content-Type": "application/json", "Idempotency-Key": idempotency.idempotencyKey },
+        body: JSON.stringify(payload),
       });
     } catch (e) { return requestError(e, "instruct_post", true); }
     const err = statusError(res, "instruct_post"); if (err) return err;
     const parsed = await responseJson<{ operation?: AgentOperation }>(res, "instruct_post", true);
     if (isToolResult(parsed)) return parsed;
     if (!parsed.operation) return unknownPostResult("instruct_post", "37Soul accepted the post request but returned no operation id.");
+    rememberOperation(idempotency.fingerprint, parsed.operation.id);
     return waitForOperation(parsed.operation);
   },
 );
