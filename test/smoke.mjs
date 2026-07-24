@@ -232,6 +232,15 @@ for (const [code, tool, pattern] of errorCases) {
 }
 status = 200;
 
+// Capture the key the first process last stored for this exact intent (after new_intent).
+// Error-case chat posts with other text must not be compared as "previous request".
+const sameIntentChat = (request) =>
+  request.url.endsWith("/chat")
+  && request.method === "POST"
+  && request.body.includes("最近怎么样");
+const priorSameIntentKey = seen.filter(sameIntentChat).at(-1).idempotencyKey;
+const operationsBeforeRestart = operations.size;
+
 await client.close();
 const restartedClient = await connectClient("restart");
 const restartedRetry = await restartedClient.callTool({
@@ -240,9 +249,10 @@ const restartedRetry = await restartedClient.callTool({
 });
 check("the idempotency ledger survives an MCP restart", () => {
   assert.match(restartedRetry.content[0].text, /又通宵改稿/);
-  const chatRequests = seen.filter((request) => request.url.endsWith("/chat") && request.method === "POST");
-  assert.equal(chatRequests.at(-1).idempotencyKey, chatRequests.at(-2).idempotencyKey);
-  assert.equal(operations.size, 3);
+  const after = seen.filter(sameIntentChat);
+  assert.equal(after.at(-1).idempotencyKey, priorSameIntentKey);
+  // Same key reuses the mock operation — no new operation row is created.
+  assert.equal(operations.size, operationsBeforeRestart);
 });
 await restartedClient.close();
 api.close();
