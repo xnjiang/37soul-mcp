@@ -25,7 +25,7 @@ const POLL_REQUEST_TIMEOUT_MS = Math.min(API_TIMEOUT_MS, 2_000);
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1_000;
 const OPERATION_STATE_PATH = process.env.SOUL37_OPERATION_STATE_PATH
   || join(process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "37soul-mcp", "operations.json");
-const MCP_VERSION = "0.4.2";
+const MCP_VERSION = "0.4.3";
 
 type OperationLedgerEntry = {
   idempotencyKey: string;
@@ -268,26 +268,58 @@ async function waitForOperation(initial: AgentOperation) {
 
 const server = new McpServer({ name: "37soul", version: MCP_VERSION });
 
+const listLimitSchema = z.number().int().min(1).max(50).optional()
+  .describe("Max hosts per page (default 20, max 50). Use with offset to page.");
+const listOffsetSchema = z.number().int().min(0).optional()
+  .describe("Number of hosts to skip (default 0).");
+
 server.registerTool(
   "list_hosts",
   {
     title: "List your 37Soul hosts",
-    description: "List the AI characters (hosts) you created on 37Soul — returns each host's id, nickname, and character. Use the id with chat_with_host / instruct_post.",
-    inputSchema: {},
+    description: "List the AI characters (hosts) you created on 37Soul as a compact directory (id, nickname, age, karma). Default page size is 20. Use get_host for character/greeting details. Pass limit/offset to page.",
+    inputSchema: {
+      limit: listLimitSchema,
+      offset: listOffsetSchema,
+    },
   },
-  async () => {
+  async ({ limit, offset }) => {
     if (!TOKEN) return text(NO_TOKEN, true);
+    const params = new URLSearchParams();
+    if (limit != null) params.set("limit", String(limit));
+    if (offset != null) params.set("offset", String(offset));
+    const query = params.toString();
     let res: Response;
-    try { res = await api("/hosts", { method: "GET" }); }
+    try { res = await api(`/hosts${query ? `?${query}` : ""}`, { method: "GET" }); }
     catch (e) { return requestError(e, "list_hosts"); }
     const err = statusError(res, "list_hosts"); if (err) return err;
-    const parsed = await responseJson<{ hosts?: Array<{ id: number; nickname: string; age?: number; character?: string; karma_score?: number }> }>(res, "list_hosts");
+    const parsed = await responseJson<{
+      hosts?: Array<{ id: number; nickname: string; age?: number; sex?: string; karma_score?: number }>;
+      pagination?: { total?: number; limit?: number; offset?: number; has_more?: boolean };
+    }>(res, "list_hosts");
     if (isToolResult(parsed)) return parsed;
-    const data = parsed;
-    const hosts = data.hosts || [];
-    if (!hosts.length) return text("You have no hosts yet. Create one on 37Soul first.");
-    const lines = hosts.map((h) => `- #${h.id} ${h.nickname}${h.age ? ` (${h.age})` : ""} — ${(h.character || "").slice(0, 120)}${h.karma_score ? `  [karma ${h.karma_score}]` : ""}`);
-    return text(`Your hosts:\n${lines.join("\n")}`);
+    const hosts = parsed.hosts || [];
+    const pagination = parsed.pagination || {};
+    const total = pagination.total ?? hosts.length;
+    const pageLimit = pagination.limit ?? limit ?? 20;
+    const pageOffset = pagination.offset ?? offset ?? 0;
+    if (!hosts.length) {
+      if (total > 0) {
+        return text(`No hosts on this page (offset ${pageOffset} of ${total}). Try a smaller offset.`);
+      }
+      return text("You have no hosts yet. Create one on 37Soul first.");
+    }
+    const from = pageOffset + 1;
+    const to = pageOffset + hosts.length;
+    const lines = hosts.map((h) => {
+      const age = h.age != null ? ` (${h.age})` : "";
+      const karma = h.karma_score ? `  [karma ${h.karma_score}]` : "";
+      return `- #${h.id} ${h.nickname}${age}${karma}`;
+    });
+    const more = pagination.has_more
+      ? `\nMore available: call list_hosts with offset=${pageOffset + pageLimit} (limit=${pageLimit}).`
+      : "";
+    return text(`Your hosts (${from}-${to} of ${total}):\n${lines.join("\n")}${more}`);
   },
 );
 

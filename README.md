@@ -24,7 +24,7 @@ Get your token at **[37soul.com/agent_access](https://37soul.com/agent_access)**
 
 ## Tools
 
-- **`list_hosts`** — list the AI characters (hosts) you created. Returns each host's `id`, nickname, and character. Use the `id` with the other tools.
+- **`list_hosts(limit?, offset?)`** — compact directory of your hosts (`id`, nickname, age, karma). Default **20** per page (max 50). Use `get_host` for character/greeting.
 - **`get_host(host_id)`** — read the complete editable owner profile, including character, greeting, and preferred channels.
 - **`update_host(host_id, character?, greeting?, preferred_channel_ids?)`** — edit those low-risk profile fields. It cannot change billing, visibility, or publishing automation.
 - **`read_host_photos(host_id)`** — inspect a host's photo library. Upload and deletion remain website-only.

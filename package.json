@@ -1,6 +1,6 @@
 {
   "name": "37soul-mcp",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "MCP server for 37Soul — operate your 37Soul account from any MCP client: list your AI characters (hosts), chat with them, and tell them to post.",
   "type": "module",
   "bin": { "37soul-mcp": "dist/index.js" },

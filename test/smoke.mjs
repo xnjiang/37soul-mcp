@@ -46,8 +46,21 @@ const api = http.createServer((req, res) => {
     };
     if (req.headers.authorization !== "Bearer tok_test") return send(401, { error: "unauthorized" });
     if (status !== 200) return send(status, { error: "forced" });
-    if (req.url === "/api/v1/me/hosts" && req.method === "GET")
-      return send(200, { hosts: [{ id: 262, nickname: "Nyx", age: 25, character: "night owl illustrator", karma_score: 120 }] });
+    if (req.url?.startsWith("/api/v1/me/hosts") && req.method === "GET" && !req.url.slice("/api/v1/me/hosts".length).match(/^\/\d/)) {
+      const url = new URL(req.url, "http://127.0.0.1");
+      const limit = Math.min(Number(url.searchParams.get("limit") || 20), 50);
+      const offset = Math.max(Number(url.searchParams.get("offset") || 0), 0);
+      const all = [
+        { id: 262, nickname: "Nyx", age: 25, karma_score: 120 },
+        { id: 261, nickname: "Luna", age: 22, karma_score: 40 },
+        { id: 260, nickname: "Zephyr", age: 28, karma_score: 10 },
+      ];
+      const page = all.slice(offset, offset + limit);
+      return send(200, {
+        hosts: page,
+        pagination: { total: all.length, limit, offset, has_more: offset + page.length < all.length },
+      });
+    }
     if (req.url === "/api/v1/me/hosts/262" && req.method === "GET")
       return send(200, { host: { id: 262, nickname: "Nyx", character: "night owl illustrator", greeting: "hi", preferred_channel_ids: [3] } });
     if (req.url === "/api/v1/me/hosts/262" && req.method === "PATCH")
@@ -125,9 +138,23 @@ check("exposes the nine documented tools", () =>
   assert.deepEqual(names, ["chat_with_host", "get_host", "get_operation", "instruct_post", "list_hosts", "read_chat_history", "read_host_photos", "read_recent_posts", "update_host"]));
 
 const hosts = await call("list_hosts");
-check("list_hosts renders the host line", () => assert.match(hosts.text, /#262 Nyx \(25\)/));
+check("list_hosts renders a compact host line", () => {
+  assert.match(hosts.text, /#262 Nyx \(25\).*karma 120/);
+  assert.match(hosts.text, /1-3 of 3/);
+  assert.doesNotMatch(hosts.text, /night owl|character:/i);
+});
 check("legacy SOUL_API_TOKEN alias authenticates requests", () =>
   assert.equal(seen.at(-1).auth, "Bearer tok_test"));
+
+const paged = await call("list_hosts", { limit: 1, offset: 1 });
+check("list_hosts pages with limit and offset", () => {
+  assert.match(paged.text, /#261 Luna \(22\)/);
+  assert.match(paged.text, /2-2 of 3/);
+  assert.match(paged.text, /offset=2/);
+  const listReq = seen.findLast((request) => request.url.startsWith("/api/v1/me/hosts") && request.method === "GET" && !request.url.match(/\/hosts\/\d/));
+  assert.match(listReq.url, /limit=1/);
+  assert.match(listReq.url, /offset=1/);
+});
 
 const fullHost = await call("get_host", { host_id: 262 });
 check("get_host renders editable fields", () => assert.match(fullHost.text, /preferred channels: 3/));
