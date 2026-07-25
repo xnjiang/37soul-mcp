@@ -1,0 +1,172 @@
+name: Sync MCP Registry
+
+# Keeps the official MCP Registry pointing at whatever version npm serves as
+# `latest`. This package shipped to npm for its whole life (through 0.4.3) while
+# being entirely absent from the registry, so registry-based discovery never found
+# it at all. It was added at 0.4.4, and this job exists so the listing cannot then
+# rot the way the sibling autowhisper-mcp's did — that one WAS listed but sat on
+# 0.1.0 while npm advanced to 0.1.4, because npm publish and registry publish were
+# two independent manual steps and nothing noticed they had diverged.
+#
+# Written as a RECONCILIATION job rather than a release hook: it does not care HOW
+# npm was published — by hand from a laptop or by another workflow — only whether
+# the two agree, and it is a no-op when they already do. The schedule is the real
+# backstop, since a hand publish may come with no push at all.
+#
+# npm remains the source of truth. This job never publishes a registry version
+# that npm does not already serve, so the registry can never point at a package
+# that cannot be installed.
+
+on:
+  push:
+    branches: [main]
+    # The normal flow commits a version bump, so a push is the usual trigger.
+    paths:
+      - package.json
+      - server.json
+      - .github/workflows/sync-mcp-registry.yml
+  schedule:
+    # Backstop for an npm publish that never came with a push.
+    - cron: "43 6 * * 2"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run every step including OIDC login, but stop before publishing"
+        type: boolean
+        default: false
+
+concurrency:
+  # Never let two runs publish the same version concurrently.
+  group: sync-mcp-registry
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # mcp-publisher login github-oidc
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Read the version npm serves as latest
+        id: npm
+        run: |
+          set -euo pipefail
+          # Hit the registry API rather than `npm view` so this needs no npm auth.
+          version=$(curl -fsSL https://registry.npmjs.org/37soul-mcp/latest | jq -r .version)
+          [ -n "$version" ] && [ "$version" != "null" ] || { echo "::error::could not read npm latest version"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "npm latest: $version"
+
+      - name: Read the version the MCP Registry serves as latest
+        id: registry
+        run: |
+          set -euo pipefail
+          # A server can have many versions; only the one flagged isLatest matters.
+          version=$(curl -fsSL "https://registry.modelcontextprotocol.io/v0/servers?search=37soul" \
+            | jq -r '[.servers[]
+                      | select(.server.name == "io.github.xnjiang/37soul-mcp")
+                      | select(._meta["io.modelcontextprotocol.registry/official"].isLatest == true)
+                      | .server.version][0] // "none"')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "registry latest: $version"
+
+      - name: Decide whether a sync is needed
+        id: decide
+        env:
+          NPM: ${{ steps.npm.outputs.version }}
+          REG: ${{ steps.registry.outputs.version }}
+          DRY: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          if [ "$NPM" = "$REG" ]; then
+            needed=false
+            echo "In sync at $NPM — nothing to publish."
+          else
+            needed=true
+            echo "::notice::Registry is on $REG but npm serves $NPM — syncing."
+          fi
+          echo "needed=$needed" >> "$GITHUB_OUTPUT"
+
+          # A dry run must be able to prove the plumbing — binary download,
+          # live-schema validation, OIDC auth — at ANY time, not only during the
+          # rare window when the versions happen to disagree. OIDC is the part
+          # most likely to break (permissions, audience, namespace ownership), so
+          # it needs to be testable on demand rather than first exercised during
+          # a real release.
+          if [ "$needed" = "true" ] || [ "$DRY" = "true" ]; then
+            echo "check_plumbing=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "check_plumbing=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # server.json is what actually gets published, so it must already describe
+      # the npm version. Publishing a mismatch would leave the registry pointing
+      # at a package version that does not exist — the failure this job prevents.
+      # Both the top-level version and packages[].version have to agree.
+      - name: Verify server.json matches the npm version
+        if: steps.decide.outputs.needed == 'true'
+        env:
+          NPM: ${{ steps.npm.outputs.version }}
+        run: |
+          set -euo pipefail
+          top=$(jq -r .version server.json)
+          pkg=$(jq -r '[.packages[] | select(.identifier == "37soul-mcp") | .version] | unique | join(",")' server.json)
+          echo "server.json version=$top  packages[]=$pkg  npm=$NPM"
+          if [ "$top" != "$NPM" ] || [ "$pkg" != "$NPM" ]; then
+            echo "::error::server.json says $top / packages[] says $pkg but npm latest is $NPM. Bump server.json (both places) to $NPM and push, then re-run."
+            exit 1
+          fi
+
+      - name: Install mcp-publisher
+        if: steps.decide.outputs.check_plumbing == 'true'
+        run: |
+          set -euo pipefail
+          # Deliberately `latest`, not pinned: the registry has migrated its
+          # server.json schema before and an older publisher 422s against it.
+          os=$(uname -s | tr '[:upper:]' '[:lower:]')
+          arch=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_${os}_${arch}.tar.gz" | tar xz mcp-publisher
+          ./mcp-publisher --version
+
+      - name: Validate server.json against the live registry schema
+        if: steps.decide.outputs.check_plumbing == 'true'
+        run: ./mcp-publisher validate
+
+      - name: Authenticate via GitHub OIDC
+        if: steps.decide.outputs.check_plumbing == 'true'
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish to the MCP Registry
+        if: steps.decide.outputs.needed == 'true' && inputs.dry_run != true
+        run: ./mcp-publisher publish
+
+      - name: Confirm the registry now serves the npm version
+        if: steps.decide.outputs.needed == 'true' && inputs.dry_run != true
+        env:
+          NPM: ${{ steps.npm.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Read back rather than trusting the publish exit code.
+          for attempt in 1 2 3 4 5; do
+            live=$(curl -fsSL "https://registry.modelcontextprotocol.io/v0/servers?search=37soul" \
+              | jq -r '[.servers[]
+                        | select(.server.name == "io.github.xnjiang/37soul-mcp")
+                        | select(._meta["io.modelcontextprotocol.registry/official"].isLatest == true)
+                        | .server.version][0] // "none"')
+            if [ "$live" = "$NPM" ]; then
+              echo "::notice::Registry now serves $live, matching npm."
+              exit 0
+            fi
+            echo "attempt $attempt: registry still on $live, waiting…"
+            sleep 6
+          done
+          echo "::error::published, but the registry still does not serve $NPM"
+          exit 1
+
+      - name: Dry run stopped before publishing
+        if: inputs.dry_run == true
+        run: |
+          echo "::notice::Dry run — OIDC login succeeded and server.json validated. Skipped publish."

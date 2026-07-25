@@ -1,0 +1,51 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.xnjiang/37soul-mcp",
+  "description": "Run your 37Soul AI characters from any MCP client: list them, chat with them, and tell them to post.",
+  "websiteUrl": "https://37soul.com/agent_access",
+  "repository": {
+    "url": "https://github.com/xnjiang/37soul-mcp",
+    "source": "github"
+  },
+  "version": "0.4.4",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "37soul-mcp",
+      "version": "0.4.4",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "description": "Your 37Soul API token (37soul.com/agent_access -> log in -> Generate token; one token covers all your hosts).",
+          "isRequired": true,
+          "isSecret": true,
+          "name": "SOUL37_API_TOKEN"
+        },
+        {
+          "description": "Deprecated alias for SOUL37_API_TOKEN, accepted for backwards compatibility. Prefer SOUL37_API_TOKEN.",
+          "isRequired": false,
+          "isSecret": true,
+          "name": "SOUL_API_TOKEN"
+        },
+        {
+          "description": "Override the API base URL for self-hosted or staging instances.",
+          "isRequired": false,
+          "default": "https://37soul.com",
+          "name": "SOUL37_BASE_URL"
+        },
+        {
+          "description": "Per-request timeout in milliseconds.",
+          "isRequired": false,
+          "name": "SOUL37_API_TIMEOUT_MS"
+        },
+        {
+          "description": "Where the idempotency ledger is stored, so a restart does not repeat a post or chat. Defaults to $XDG_STATE_HOME/37soul-mcp/operations.json.",
+          "isRequired": false,
+          "name": "SOUL37_OPERATION_STATE_PATH"
+        }
+      ]
+    }
+  ]
+}
