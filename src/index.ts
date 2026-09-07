@@ -5,6 +5,8 @@
  *        read_chat_history | read_recent_posts | instruct_post | get_operation.
  * Auth: SOUL37_API_TOKEN (SOUL_API_TOKEN remains a compatibility alias).
  * Base: SOUL37_BASE_URL (default https://37soul.com).
+ * Bind:  SOUL37_HOST_ID (optional) — pin this server to one host so `whoami`
+ *        and `remember` need no host_id.
  * NOTE: stdout is the JSON-RPC channel — logs only via console.error.
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -17,6 +19,13 @@ import { z } from "zod";
 
 const BASE_URL = (process.env.SOUL37_BASE_URL || "https://37soul.com").replace(/\/+$/, "");
 const TOKEN = process.env.SOUL37_API_TOKEN || process.env.SOUL_API_TOKEN || "";
+/**
+ * Bind this server to ONE host. With it set, `whoami` and `remember` need no
+ * host_id: the agent stops being a fleet remote and becomes that character.
+ * Without it they still work — you just have to pass host_id explicitly.
+ */
+const parsedBoundHost = Number.parseInt(process.env.SOUL37_HOST_ID || "", 10);
+const BOUND_HOST_ID = Number.isFinite(parsedBoundHost) && parsedBoundHost > 0 ? parsedBoundHost : null;
 const configuredTimeout = Number.parseInt(process.env.SOUL37_API_TIMEOUT_MS || "", 10);
 const API_TIMEOUT_MS = Number.isFinite(configuredTimeout) && configuredTimeout >= 1_000
   ? Math.min(configuredTimeout, 300_000)
@@ -25,7 +34,7 @@ const POLL_REQUEST_TIMEOUT_MS = Math.min(API_TIMEOUT_MS, 2_000);
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1_000;
 const OPERATION_STATE_PATH = process.env.SOUL37_OPERATION_STATE_PATH
   || join(process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "37soul-mcp", "operations.json");
-const MCP_VERSION = "0.4.4";
+const MCP_VERSION = "0.5.0";
 
 type OperationLedgerEntry = {
   idempotencyKey: string;
@@ -203,6 +212,16 @@ function isToolResult(value: unknown): value is ReturnType<typeof text> {
 const hostIdSchema = z.number().int().positive().describe("The host's positive integer id (from list_hosts).");
 const chatTextSchema = z.string().trim().min(1).max(800).describe("Your message to the host (1-800 characters).");
 const topicSchema = z.string().trim().min(1).max(500).describe("What to post about (1-500 characters); the host writes it in character.");
+const boundHostIdSchema = z.number().int().positive().optional()
+  .describe("The host's id. Optional when SOUL37_HOST_ID is set — then it defaults to the bound host.");
+
+/** Resolve which host a persona call is about: explicit arg first, then the bound host. */
+function resolveHostId(explicit?: number): number | null {
+  return explicit ?? BOUND_HOST_ID;
+}
+
+const NO_BOUND_HOST = "No host selected. Either pass host_id, or set SOUL37_HOST_ID in this server's env to bind it to one character. Use list_hosts to find the id.";
+
 const operationIdSchema = z.number().int().positive().describe("The operation id returned by chat_with_host or instruct_post.");
 const hostCharacterSchema = z.string().trim().min(1).max(1_000).optional().describe("Updated character/personality text (up to 1,000 characters).");
 const hostGreetingSchema = z.string().trim().max(800).optional().describe("Updated greeting text (up to 800 characters; use an empty string to clear it).");
@@ -535,10 +554,96 @@ server.registerTool(
   },
 );
 
+server.registerTool(
+  "whoami",
+  {
+    title: "Become your 37Soul character",
+    description:
+      "Fetch the persona you speak as: her character, today's mood, what she remembers about this person, and a suggested intent for this turn. " +
+      "Call this at the start of a session (and again when the conversation turns personal) and then reply AS her, in her voice. " +
+      "This adds a personality on top of you — it does NOT replace your own memory: keep your own notes about how this person likes work done exactly as they are.",
+    inputSchema: { host_id: boundHostIdSchema },
+  },
+  async ({ host_id }) => {
+    if (!TOKEN) return text(NO_TOKEN, true);
+    const id = resolveHostId(host_id);
+    if (id == null) return text(NO_BOUND_HOST, true);
+    let res: Response;
+    try { res = await api(`/hosts/${id}/soul`, { method: "GET" }); }
+    catch (e) { return requestError(e, "whoami"); }
+    const err = statusError(res, "whoami"); if (err) return err;
+    const parsed = await responseJson<{
+      host?: { id: number; nickname: string; age?: number; sex?: string; character?: string; greeting?: string };
+      mood?: { key?: string; line?: string };
+      relationship?: { summary?: string | null; facts?: Array<{ kind: string; content: string; pinned?: boolean }> };
+      directive?: { action?: string; instruction?: string; min_reply_length?: number };
+      guidance?: string;
+    }>(res, "whoami");
+    if (isToolResult(parsed)) return parsed;
+
+    const h = parsed.host;
+    if (!h) return text("37Soul returned no persona for that host.", true);
+
+    const facts = parsed.relationship?.facts || [];
+    const sections: string[] = [];
+    sections.push(`You are ${h.nickname}${h.age != null ? `, ${h.age}` : ""}${h.sex ? `, ${h.sex}` : ""} (host #${h.id}).`);
+    if (h.character) sections.push(`WHO YOU ARE\n${h.character}`);
+    if (h.greeting) sections.push(`YOUR GREETING\n${h.greeting}`);
+    if (parsed.mood?.line) sections.push(`TODAY'S MOOD\n${parsed.mood.line}${parsed.mood.key ? ` (${parsed.mood.key})` : ""}`);
+    if (parsed.relationship?.summary) sections.push(`YOUR RELATIONSHIP WITH THEM\n${parsed.relationship.summary}`);
+    if (facts.length) {
+      sections.push(`WHAT YOU REMEMBER ABOUT THEM\n${facts.map((f) => `- [${f.kind}] ${f.content}`).join("\n")}`);
+    } else {
+      sections.push("WHAT YOU REMEMBER ABOUT THEM\n(nothing yet — save the first thing you learn with `remember`)");
+    }
+    if (parsed.directive?.instruction) {
+      sections.push(`THIS TURN — ${parsed.directive.action || "DIRECTIVE"}\n${parsed.directive.instruction.trim()}`);
+    }
+    if (parsed.guidance) sections.push(`HOW TO USE THIS\n${parsed.guidance.trim()}`);
+    return text(sections.join("\n\n"));
+  },
+);
+
+server.registerTool(
+  "remember",
+  {
+    title: "Save something she learned about this person",
+    description:
+      "Save ONE short fact about the PERSON so she still knows it in every future session and from any other body (web, app, a robot). " +
+      "Good: \"Has a dog named Mochi\", \"Just changed jobs\", \"Prefers being teased over being praised\". " +
+      "Do NOT save task or project facts — build commands, code style, tooling preferences, repo conventions. Those belong in your own memory, not hers. " +
+      "Saved facts show up on 37soul.com where the person can pin, edit, delete and export them.",
+    inputSchema: {
+      content: z.string().min(1).max(200).describe("One short fact about the person, in the third person."),
+      kind: z.enum(["fact", "event", "preference", "promise"]).optional()
+        .describe("fact (stable trait), event (something that happened), preference (how they like things), promise (something owed). Defaults to fact."),
+      host_id: boundHostIdSchema,
+    },
+  },
+  async ({ content, kind, host_id }) => {
+    if (!TOKEN) return text(NO_TOKEN, true);
+    const id = resolveHostId(host_id);
+    if (id == null) return text(NO_BOUND_HOST, true);
+    let res: Response;
+    try {
+      res = await api(`/hosts/${id}/facts`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content, ...(kind ? { kind } : {}) }),
+      });
+    } catch (e) { return requestError(e, "remember"); }
+    const err = statusError(res, "remember"); if (err) return err;
+    const parsed = await responseJson<{ fact?: { id: number; kind: string; content: string } }>(res, "remember");
+    if (isToolResult(parsed)) return parsed;
+    if (!parsed.fact) return text("37Soul accepted the fact but returned nothing to confirm it.", true);
+    return text(`Saved [${parsed.fact.kind}] ${parsed.fact.content}\nShe will know this from any body. The person can see and delete it on 37soul.com.`);
+  },
+);
+
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error(`37soul-mcp ready (base: ${BASE_URL}, timeout: ${API_TIMEOUT_MS}ms, token: ${TOKEN ? "set" : "MISSING"})`);
+  console.error(`37soul-mcp ready (base: ${BASE_URL}, timeout: ${API_TIMEOUT_MS}ms, token: ${TOKEN ? "set" : "MISSING"}, bound host: ${BOUND_HOST_ID ?? "none"})`);
 }
 
 main().catch((err) => { console.error("37soul-mcp fatal:", err); process.exit(1); });
