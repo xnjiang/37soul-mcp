@@ -35,7 +35,7 @@ const POLL_REQUEST_TIMEOUT_MS = Math.min(API_TIMEOUT_MS, 2_000);
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1_000;
 const OPERATION_STATE_PATH = process.env.SOUL37_OPERATION_STATE_PATH
   || join(process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "37soul-mcp", "operations.json");
-const MCP_VERSION = "0.7.1";
+const MCP_VERSION = "0.7.2";
 
 type OperationLedgerEntry = {
   idempotencyKey: string;
@@ -829,16 +829,28 @@ server.registerTool(
     // 这条路的错误码和别处语义不同，不能落进通用的 statusError：
     // 403 在别处是「host 未上架」，这里是「kind 不对」；503 在别处是「稍后重试」，
     // 这里还要说清**钱已经退了**，否则模型不敢重试，或者以为白扣了一次。
+    //
+    // ⚠️ 每条拒绝都分成两半，理由同上面那段等待文案：**她不会说「你的账户余额不足」**。
+    // 账户、额度、每小时上限、退款 —— 这些词是系统在说话，从她嘴里出来就穿帮了。
+    // WHY 是给模型判断下一步用的，TO THEM 是她能说的话。
     if (!res.ok) {
       switch (res.status) {
         case 402: return text(
-          "Not enough credits to shoot. The account has to top up on 37soul.com. Do not retry — tell them.", true);
+          "WHY: the account is out of credits. It has to top up on 37soul.com. Do not retry.\n" +
+          "TO THEM, as her: she cannot right now, and be honest that it is not a mood — " +
+          "something on her end is used up for today. Do not say \"account\", \"credits\" or \"top up\"; " +
+          "if they need the real reason, the person who made her can see it on 37soul.com.", true);
         case 429: return text(
-          "She has shot too many in the past hour. Wait — do not retry now.", true);
+          "WHY: too many shot in the past hour. Wait; do not retry now.\n" +
+          "TO THEM, as her: she has been taking a lot of these and wants a break before the next one. " +
+          "Do not quote a limit or a count.", true);
         case 503: return text(
-          "Generation failed and the credits were already refunded, so nothing was charged. Safe to try once more.", true);
+          "WHY: generation failed. The credits were already refunded — nothing was charged. Safe to try once more.\n" +
+          "TO THEM, as her: that one did not come out. Offer to try again. " +
+          "Do not mention refunds or charges — she would not talk about money.", true);
         case 409: return text(
-          "She is already shooting a video for this conversation. Wait for that one instead of starting another.", true);
+          "WHY: a video for this conversation is still being shot. Wait for that one.\n" +
+          "TO THEM, as her: she is still working on the last one.", true);
         default: return statusError(res, "shoot") ?? text(`Could not shoot (${res.status}).`, true);
       }
     }
@@ -861,15 +873,23 @@ server.registerTool(
 
     // 视频是异步的。⚠️ 必须指明去 read_chat_history 取 —— 私聊里买的媒体永远不进
     // 公开相册，模型去 whoami 的 videos 里等会等到天荒地老。
-    // ⚠️ 等待时间写死一个实测值，不写「几十秒到几分钟」。2026-09-08 实测一条 4 秒片
-    // 是 94.6 秒；上一次模型看到模糊说法后自己挑了 sleep 50，必然扑空、然后报「没拍成」。
-    // 「查不到 ≠ 失败」也必须说 —— 真失败时对话里会有一条明确的失败消息。
+    // ⚠️ 这段有**两个读者**，别混。
+    //
+    // 秒数是给**你自己**排等待用的：2026-09-08 实测一条 4 秒片 94.6 秒，而上一次
+    // 文案写「几十秒到几分钟」时模型自己挑了 sleep 50，必然扑空、然后报「没拍成」。
+    // 所以数字必须精确。
+    //
+    // 但**她不会报秒数**。人不会说「大概一分半就好」—— 那是机器在说话。所以这里
+    // 明确把「用来等」和「用来说」分开，否则模型会把 95 秒原样转述给用户。
     return text(
-      "She is shooting it now. It takes about 95 seconds, sometimes longer if she is busy. " +
-      "Tell them it is coming, wait at least 100 seconds, then look for it with read_chat_history. " +
-      "If it is not there yet, wait another 60 and look again — an empty result means NOT READY, not failed. " +
+      "She is shooting it now.\n\n" +
+      "FOR YOUR TIMING (do not say any of these numbers out loud): it usually lands in about " +
+      "95 seconds, sometimes longer. Wait at least 100 seconds, then look with read_chat_history. " +
+      "Not there yet? Wait another 60 and look again — an empty result means NOT READY, not failed. " +
       "When it really fails she says so in the conversation, in her own words. " +
-      "Do NOT wait for it in whoami's `videos`: media shot inside a conversation never enters her public album." +
+      "Do NOT wait for it in whoami's `videos`: media shot inside a conversation never enters her public album.\n\n" +
+      "TO THEM, say it as her — she is shooting, it will be a moment. No countdown, no seconds, " +
+      "no progress report. A person does not quote you a duration." +
       (parsed.credits_remaining != null ? `\nCredits left: ${parsed.credits_remaining}.` : ""),
     );
   },

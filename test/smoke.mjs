@@ -330,6 +330,12 @@ check("等待时间是具体的，不是「几十秒到几分钟」", () => {
 check("说清查不到只是还没好，不是失败", () => {
   assert.match(clip.text, /NOT READY, not failed/);
 });
+// 秒数是给 agent 排等待用的，**不是给她说的**。人不会报「大概一分半就好」——
+// 那是机器在说话。两个读者必须在文案里分开，否则模型会把 95 秒原样转述出去。
+check("明确禁止把秒数说给用户", () => {
+  assert.match(clip.text, /do not say any of these numbers out loud/i);
+  assert.match(clip.text, /No countdown, no seconds/i);
+});
 check("视频是异步的，明确指向 read_chat_history 而不是相册", () => {
   assert.match(clip.text, /read_chat_history/);
   // ⚠️ 私聊里买的媒体永远不进公开相册，模型去 whoami 的 videos 里等会等到天荒地老
@@ -339,18 +345,29 @@ check("视频是异步的，明确指向 read_chat_history 而不是相册", () 
 
 // 这四个码在 /media 上的语义和别处不同，不能落进通用的 statusError：
 // 403 在别处是「host 未上架」，503 在别处只说「稍后重试」——这里还必须说清钱退了。
-for (const [id, expect] of [
-  ["402", /top up/i],
-  ["429", /too many|wait/i],
+for (const [id, why] of [
+  ["402", /out of credits/i],
+  ["429", /too many/i],
   ["503", /refunded/i],
-  ["409", /already shooting/i],
+  ["409", /still being shot/i],
 ]) {
   const failed = await call("shoot", { host_id: Number(id) });
   check(`shoot HTTP ${id} → 说得清下一步该干嘛`, () => {
     assert.equal(failed.isError, true);
-    assert.match(failed.text, expect);
+    assert.match(failed.text, why);
+  });
+  // 每条拒绝都得**两半齐全**：WHY 给模型判断，TO THEM 是她能说的话。
+  // 只有 WHY 的话，模型会把「账户余额不足」原样念给用户 —— 她不会那样说话。
+  check(`shoot HTTP ${id} → 分开了「给模型的原因」和「她怎么说」`, () => {
+    assert.match(failed.text, /^WHY:/m);
+    assert.match(failed.text, /TO THEM, as her:/);
   });
 }
+// 402 是最容易穿帮的一条：账户、额度、充值这三个词从她嘴里出来就露馅了。
+check("402 明确禁用「账户/额度/充值」这几个词", async () => {
+  const failed = await call("shoot", { host_id: 402 });
+  assert.match(failed.text, /Do not say .*account.*credits.*top up/i);
+});
 const turnRequest = seen.filter((r) => r.url === "/api/v1/me/hosts/262/turn").at(-1);
 
 check("log_turn writes both sides back", () => {
