@@ -35,7 +35,7 @@ const POLL_REQUEST_TIMEOUT_MS = Math.min(API_TIMEOUT_MS, 2_000);
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1_000;
 const OPERATION_STATE_PATH = process.env.SOUL37_OPERATION_STATE_PATH
   || join(process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "37soul-mcp", "operations.json");
-const MCP_VERSION = "0.7.0";
+const MCP_VERSION = "0.7.1";
 
 type OperationLedgerEntry = {
   idempotencyKey: string;
@@ -805,7 +805,7 @@ server.registerTool(
       "Ask her to shoot something NEW this moment — not one of the pictures she already has (those are in whoami's `photos` / `videos`). " +
       "Use it when the person asks for a picture of her right now. " +
       "It spends the account's credits and is capped per hour, so do not call it on your own initiative and never retry a refusal in a loop. " +
-      "`photo` comes back immediately with a URL; `video` takes tens of seconds to minutes and arrives later in `read_chat_history`.",
+      "`photo` comes back immediately with a URL; `video` takes about 95 seconds (measured) and arrives later in `read_chat_history`.",
     inputSchema: {
       kind: z.enum(["photo", "video"]).default("photo")
         .describe("`photo` is instant. `video` is asynchronous and costs much more — only when they asked for a video."),
@@ -861,9 +861,14 @@ server.registerTool(
 
     // 视频是异步的。⚠️ 必须指明去 read_chat_history 取 —— 私聊里买的媒体永远不进
     // 公开相册，模型去 whoami 的 videos 里等会等到天荒地老。
+    // ⚠️ 等待时间写死一个实测值，不写「几十秒到几分钟」。2026-09-08 实测一条 4 秒片
+    // 是 94.6 秒；上一次模型看到模糊说法后自己挑了 sleep 50，必然扑空、然后报「没拍成」。
+    // 「查不到 ≠ 失败」也必须说 —— 真失败时对话里会有一条明确的失败消息。
     return text(
-      "She is shooting the video now — it takes tens of seconds to a few minutes. " +
-      "Tell them it is coming, then look for it later with read_chat_history. " +
+      "She is shooting it now. It takes about 95 seconds, sometimes longer if she is busy. " +
+      "Tell them it is coming, wait at least 100 seconds, then look for it with read_chat_history. " +
+      "If it is not there yet, wait another 60 and look again — an empty result means NOT READY, not failed. " +
+      "When it really fails she says so in the conversation, in her own words. " +
       "Do NOT wait for it in whoami's `videos`: media shot inside a conversation never enters her public album." +
       (parsed.credits_remaining != null ? `\nCredits left: ${parsed.credits_remaining}.` : ""),
     );

@@ -320,6 +320,16 @@ check("shoot 默认拍照片，不默默拍视频（视频贵得多）", () => {
 });
 
 const clip = await call("shoot", { host_id: 262, kind: "video" });
+// 2026-09-08 实测：一条 4 秒片 94.6 秒出片。上一版文案写「几十秒到几分钟」，
+// 模型自己挑了 sleep 50 → 必然扑空 → 报「没拍成」，而后端其实在正常生成。
+// 所以等待时间写实测值，并且明说「查不到 ≠ 失败」。
+check("等待时间是具体的，不是「几十秒到几分钟」", () => {
+  assert.match(clip.text, /95 seconds/);
+  assert.match(clip.text, /at least 100 seconds/);
+});
+check("说清查不到只是还没好，不是失败", () => {
+  assert.match(clip.text, /NOT READY, not failed/);
+});
 check("视频是异步的，明确指向 read_chat_history 而不是相册", () => {
   assert.match(clip.text, /read_chat_history/);
   // ⚠️ 私聊里买的媒体永远不进公开相册，模型去 whoami 的 videos 里等会等到天荒地老
