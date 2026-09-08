@@ -91,6 +91,34 @@ const api = http.createServer((req, res) => {
       return send(200, { posts: [
         { id: 987, text: "凌晨三点的显示器", image: null, created_at: "2026-07-22T09:00:00Z" },
       ] });
+    if (req.url.startsWith("/api/v1/me/hosts/262/soul") && req.method === "GET")
+      return send(200, {
+        host: { id: 262, nickname: "Nyx", age: 25, sex: "female", character: "night owl illustrator", greeting: "hi" },
+        mood: { key: "playful", line: "今天有点想闹腾" },
+        relationship: {
+          summary: "聊过三次，主要聊工作",
+          facts: [{ kind: "fact", content: "养了只叫 Mochi 的狗" }],
+          temperature: "warm",
+          days_since_last_talk: 1,
+          messages_exchanged: 12,
+        },
+        recent_life: [{ text: "今天把稿子改完了", image: "https://files.example/desk.webp" }],
+        photos: [{ caption: "天台", url: "https://files.example/roof.webp" }],
+        videos: [{ caption: "风车", url: "https://files.example/mill.mp4" }],
+        thread: { text: "把那批照片重新洗一遍", kind: "doing", days_in: 2, resolution: null },
+        circle: [{ nickname: "沈青", closeness: "familiar", mutual: true, interactions: 5 }],
+        directive: { action: "SHARE", instruction: "THIS TURN — SHARE: bring up your own week.", min_reply_length: 150 },
+        guidance: "You are still yourself.",
+      });
+    if (req.url === "/api/v1/me/hosts/262/facts" && req.method === "POST") {
+      const parsedBody = JSON.parse(body || "{}");
+      // 用户在网页上删过的那条：服务端返回墓碑，不复活。
+      if (parsedBody.content === "不想再提前任")
+        return send(200, { fact: { id: 9, kind: "fact", content: "不想再提前任", dismissed: true } });
+      return send(201, { fact: { id: 8, kind: parsedBody.kind || "fact", content: parsedBody.content, dismissed: false } });
+    }
+    if (req.url === "/api/v1/me/hosts/262/turn" && req.method === "POST")
+      return send(201, { messages: [{ id: 21, source: "agent" }, { id: 22, source: "agent" }] });
     if (req.url.endsWith("/instruct") && req.method === "POST")
       return send(202, { operation: operation("post", String(req.headers["idempotency-key"])) });
     send(404, { error: "nope" });
@@ -134,8 +162,8 @@ const check = (label, fn) => {
 
 const { tools } = await client.listTools();
 const names = tools.map((t) => t.name).sort();
-check("exposes the nine documented tools", () =>
-  assert.deepEqual(names, ["chat_with_host", "get_host", "get_operation", "instruct_post", "list_hosts", "read_chat_history", "read_host_photos", "read_recent_posts", "update_host"]));
+check("exposes the twelve documented tools", () =>
+  assert.deepEqual(names, ["chat_with_host", "get_host", "get_operation", "instruct_post", "list_hosts", "log_turn", "read_chat_history", "read_host_photos", "read_recent_posts", "remember", "update_host", "whoami"]));
 
 const hosts = await call("list_hosts");
 check("list_hosts renders a compact host line", () => {
@@ -235,6 +263,68 @@ check("incomplete POST response is treated as an unknown result", () => {
   assert.ok(incompletePost.isError);
   assert.match(incompletePost.text, /may still have been published/i);
 });
+
+// ── 人格模式：0.5.0 上线 whoami / remember 时没更新工具名断言，这两个工具此前
+// 没有任何 smoke 覆盖。log_turn 一起补上。
+const soul = await call("whoami", { host_id: 262 });
+const soulRequest = seen.filter((r) => r.url.startsWith("/api/v1/me/hosts/262/soul")).at(-1);
+
+check("whoami sends a turn token, so the directive is not frozen and the turn is billed once", () =>
+  assert.match(soulRequest.url, /[?&]turn=[^&]+/));
+
+check("whoami renders her own life, not just her character", () => {
+  assert.match(soul.text, /night owl illustrator/);
+  assert.match(soul.text, /今天有点想闹腾/);
+  assert.match(soul.text, /今天把稿子改完了/);          // recent_life
+  assert.match(soul.text, /files\.example\/desk\.webp/); // 动态自带的图
+  assert.match(soul.text, /把那批照片重新洗一遍/);       // thread
+  assert.match(soul.text, /沈青/);                        // circle
+  assert.match(soul.text, /files\.example\/roof\.webp/); // photos
+  assert.match(soul.text, /files\.example\/mill\.mp4/);  // videos
+  assert.match(soul.text, /warm/);                        // temperature
+  assert.match(soul.text, /THIS TURN — SHARE/);
+});
+
+check("whoami tells the agent to send the exchange back", () =>
+  assert.match(soul.text, /log_turn/));
+
+const logged = await call("log_turn", { host_id: 262, user_message: "我这周把猫接回来了", host_message: "那家伙终于回家了" });
+const turnRequest = seen.filter((r) => r.url === "/api/v1/me/hosts/262/turn").at(-1);
+
+check("log_turn writes both sides back", () => {
+  assert.match(logged.text, /Logged this exchange/);
+  assert.match(turnRequest.body, /我这周把猫接回来了/);
+  assert.match(turnRequest.body, /那家伙终于回家了/);
+});
+
+check("log_turn reuses the turn whoami paid for, so the exchange is billed once", () => {
+  const soulTurn = new URL(soulRequest.url, "http://x").searchParams.get("turn");
+  assert.equal(JSON.parse(turnRequest.body).turn, soulTurn);
+});
+
+const soul2 = await call("whoami", { host_id: 262 });
+check("consecutive whoami calls do not reuse one turn token", () => {
+  const first = new URL(soulRequest.url, "http://x").searchParams.get("turn");
+  const second = new URL(seen.filter((r) => r.url.startsWith("/api/v1/me/hosts/262/soul")).at(-1).url, "http://x").searchParams.get("turn");
+  assert.notEqual(first, second);
+  assert.ok(soul2.text.length > 0);
+});
+
+const longTurn = await call("log_turn", { host_id: 262, user_message: "hi", host_message: "x".repeat(1200) });
+check("log_turn says which side it trimmed", () => {
+  assert.match(longTurn.text, /trimmed to 800/);
+  assert.equal(JSON.parse(seen.filter((r) => r.url === "/api/v1/me/hosts/262/turn").at(-1).body).host_message.length, 800);
+});
+
+const saved = await call("remember", { host_id: 262, content: "养了只叫 Mochi 的狗" });
+check("remember confirms a real save", () => assert.match(saved.text, /Saved \[fact\]/));
+
+const tombstoned = await call("remember", { host_id: 262, content: "不想再提前任" });
+check("remember does not claim to have saved a fact the person deleted", () => {
+  assert.doesNotMatch(tombstoned.text, /^Saved/m);
+  assert.match(tombstoned.text, /deleted/);
+});
+
 
 const errorCases = [
   [401, "instruct_post", /token/i],

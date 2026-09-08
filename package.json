@@ -1,6 +1,6 @@
 {
   "name": "37soul-mcp",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "mcpName": "io.github.xnjiang/37soul-mcp",
   "description": "MCP server for 37Soul — operate your 37Soul account from any MCP client: list your AI characters (hosts), chat with them, and tell them to post.",
   "type": "module",

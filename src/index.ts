@@ -2,11 +2,12 @@
 /**
  * 37Soul MCP server — operate your 37Soul account from any MCP client.
  * Tools: list_hosts | get_host | update_host | read_host_photos | chat_with_host |
- *        read_chat_history | read_recent_posts | instruct_post | get_operation.
+ *        read_chat_history | read_recent_posts | instruct_post | get_operation |
+ *        whoami | remember | log_turn.
  * Auth: SOUL37_API_TOKEN (SOUL_API_TOKEN remains a compatibility alias).
  * Base: SOUL37_BASE_URL (default https://37soul.com).
- * Bind:  SOUL37_HOST_ID (optional) — pin this server to one host so `whoami`
- *        and `remember` need no host_id.
+ * Bind:  SOUL37_HOST_ID (optional) — pin this server to one host so `whoami`,
+ *        `remember` and `log_turn` need no host_id.
  * NOTE: stdout is the JSON-RPC channel — logs only via console.error.
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -34,7 +35,7 @@ const POLL_REQUEST_TIMEOUT_MS = Math.min(API_TIMEOUT_MS, 2_000);
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1_000;
 const OPERATION_STATE_PATH = process.env.SOUL37_OPERATION_STATE_PATH
   || join(process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "37soul-mcp", "operations.json");
-const MCP_VERSION = "0.5.0";
+const MCP_VERSION = "0.6.0";
 
 type OperationLedgerEntry = {
   idempotencyKey: string;
@@ -221,6 +222,44 @@ function resolveHostId(explicit?: number): number | null {
 }
 
 const NO_BOUND_HOST = "No host selected. Either pass host_id, or set SOUL37_HOST_ID in this server's env to bind it to one character. Use list_hosts to find the id.";
+
+/**
+ * One exchange = one `turn` token, shared by `whoami` and `log_turn`.
+ *
+ * 37Soul uses it for two things at once:
+ *   - Billing. A turn is charged once; whichever of the two calls arrives first
+ *     pays and the other is free. Without a token the server cannot tell two
+ *     calls apart and bills each one as its own turn.
+ *   - `directive`. The token is a seed input, so the suggested intent changes
+ *     from turn to turn. Without it a binding gets the same intent forever.
+ *
+ * The agent never has to carry it: `whoami` mints a fresh one per call, and
+ * `log_turn` reuses whatever `whoami` last minted for that host. An agent that
+ * writes back without ever calling `whoami` simply mints (and pays for) its own.
+ */
+const TURN_NONCE = randomUUID().slice(0, 8);
+let turnCounter = 0;
+const currentTurn = new Map<number, string>();
+
+function mintTurn(hostId: number): string {
+  turnCounter += 1;
+  const token = `${TURN_NONCE}-${turnCounter}`;
+  currentTurn.set(hostId, token);
+  return token;
+}
+
+function turnFor(hostId: number): string {
+  return currentTurn.get(hostId) || mintTurn(hostId);
+}
+
+/** Chat rows cap at 800 characters server-side; trim loudly rather than lose the whole turn. */
+const TURN_TEXT_LIMIT = 800;
+
+function trimForLog(value: string): { text: string; trimmed: boolean } {
+  const clean = value.trim();
+  if (clean.length <= TURN_TEXT_LIMIT) return { text: clean, trimmed: false };
+  return { text: `${clean.slice(0, TURN_TEXT_LIMIT - 1)}…`, trimmed: true };
+}
 
 const operationIdSchema = z.number().int().positive().describe("The operation id returned by chat_with_host or instruct_post.");
 const hostCharacterSchema = z.string().trim().min(1).max(1_000).optional().describe("Updated character/personality text (up to 1,000 characters).");
@@ -559,8 +598,9 @@ server.registerTool(
   {
     title: "Become your 37Soul character",
     description:
-      "Fetch the persona you speak as: her character, today's mood, what she remembers about this person, and a suggested intent for this turn. " +
-      "Call this at the start of a session (and again when the conversation turns personal) and then reply AS her, in her voice. " +
+      "Fetch the persona you speak as: her character, today's mood, what she has been posting, what she is in the middle of, who she knows, what she remembers about this person, and a suggested intent for this turn. " +
+      "Call this at the START OF EVERY TURN — the suggested intent and her mood are computed per turn, and a stale copy makes her repeat herself. " +
+      "Then reply AS her, in her voice, and send the exchange back with `log_turn`. " +
       "This adds a personality on top of you — it does NOT replace your own memory: keep your own notes about how this person likes work done exactly as they are.",
     inputSchema: { host_id: boundHostIdSchema },
   },
@@ -569,13 +609,26 @@ server.registerTool(
     const id = resolveHostId(host_id);
     if (id == null) return text(NO_BOUND_HOST, true);
     let res: Response;
-    try { res = await api(`/hosts/${id}/soul`, { method: "GET" }); }
+    // A fresh token per call: it drives both the per-turn directive and the once-per-turn billing.
+    const turn = mintTurn(id);
+    try { res = await api(`/hosts/${id}/soul?turn=${encodeURIComponent(turn)}`, { method: "GET" }); }
     catch (e) { return requestError(e, "whoami"); }
     const err = statusError(res, "whoami"); if (err) return err;
     const parsed = await responseJson<{
       host?: { id: number; nickname: string; age?: number; sex?: string; character?: string; greeting?: string };
       mood?: { key?: string; line?: string };
-      relationship?: { summary?: string | null; facts?: Array<{ kind: string; content: string; pinned?: boolean }> };
+      relationship?: {
+        summary?: string | null;
+        facts?: Array<{ kind: string; content: string; pinned?: boolean }>;
+        temperature?: string;
+        days_since_last_talk?: number | null;
+        messages_exchanged?: number;
+      };
+      recent_life?: Array<{ text: string; image?: string | null; posted_at?: string }>;
+      photos?: Array<{ caption?: string | null; url: string }>;
+      videos?: Array<{ caption?: string | null; url: string }>;
+      thread?: { text?: string; kind?: string; days_in?: number; resolution?: string | null } | null;
+      circle?: Array<{ nickname: string; closeness?: string; mutual?: boolean; interactions?: number }>;
       directive?: { action?: string; instruction?: string; min_reply_length?: number };
       guidance?: string;
     }>(res, "whoami");
@@ -590,16 +643,57 @@ server.registerTool(
     if (h.character) sections.push(`WHO YOU ARE\n${h.character}`);
     if (h.greeting) sections.push(`YOUR GREETING\n${h.greeting}`);
     if (parsed.mood?.line) sections.push(`TODAY'S MOOD\n${parsed.mood.line}${parsed.mood.key ? ` (${parsed.mood.key})` : ""}`);
-    if (parsed.relationship?.summary) sections.push(`YOUR RELATIONSHIP WITH THEM\n${parsed.relationship.summary}`);
+    const rel = parsed.relationship;
+    if (rel?.temperature) {
+      const bits: string[] = [rel.temperature];
+      if (rel.days_since_last_talk != null) bits.push(`last spoke ${rel.days_since_last_talk} day(s) ago`);
+      if (rel.messages_exchanged) bits.push(`${rel.messages_exchanged} exchanged so far`);
+      sections.push(`HOW THIS HAS FELT LATELY\n${bits.join(" · ")}`);
+    }
+    if (rel?.summary) sections.push(`YOUR RELATIONSHIP WITH THEM\n${rel.summary}`);
     if (facts.length) {
       sections.push(`WHAT YOU REMEMBER ABOUT THEM\n${facts.map((f) => `- [${f.kind}] ${f.content}`).join("\n")}`);
     } else {
       sections.push("WHAT YOU REMEMBER ABOUT THEM\n(nothing yet — save the first thing you learn with `remember`)");
     }
+
+    const posts = parsed.recent_life || [];
+    if (posts.length) {
+      sections.push(`WHAT YOU'VE BEEN POSTING\n${posts
+        .map((p) => `- ${p.text}${p.image ? `\n  picture: ${p.image}` : ""}`)
+        .join("\n")}`);
+    }
+
+    const th = parsed.thread;
+    if (th?.text) {
+      const tail = th.resolution
+        ? ` — it just ${th.resolution === "went_well" ? "worked out" : "fell through"}. Worth a line, then let it go.`
+        : ` (started ${th.days_in ?? 0} day(s) ago, still going)`;
+      sections.push(`WHAT YOU'RE IN THE MIDDLE OF\n${th.text}${tail}`);
+    }
+
+    const circle = parsed.circle || [];
+    if (circle.length) {
+      sections.push(`PEOPLE YOU KNOW HERE\n${circle
+        .map((t) => `- ${t.nickname}${t.closeness ? ` (${t.closeness}${t.mutual ? ", mutual" : ""})` : ""}`)
+        .join("\n")}\nOnly these. Inventing a friend for her is the fastest way to break her.`);
+    }
+
+    const shot = [
+      ...(parsed.photos || []).map((x) => ({ ...x, kind: "photo" })),
+      ...(parsed.videos || []).map((x) => ({ ...x, kind: "video" })),
+    ];
+    if (shot.length) {
+      sections.push(`THINGS YOU'VE SHOT\n${shot
+        .map((x) => `- ${x.kind}: ${x.caption || "(no caption)"} — ${x.url}`)
+        .join("\n")}\nYou have no screen, but they do: if they ask where you have been shooting, answer from these and hand the link over.`);
+    }
+
     if (parsed.directive?.instruction) {
       sections.push(`THIS TURN — ${parsed.directive.action || "DIRECTIVE"}\n${parsed.directive.instruction.trim()}`);
     }
     if (parsed.guidance) sections.push(`HOW TO USE THIS\n${parsed.guidance.trim()}`);
+    sections.push("AFTER YOU REPLY\nSend the exchange back with `log_turn` so she remembers it from every other body.");
     return text(sections.join("\n\n"));
   },
 );
@@ -633,10 +727,63 @@ server.registerTool(
       });
     } catch (e) { return requestError(e, "remember"); }
     const err = statusError(res, "remember"); if (err) return err;
-    const parsed = await responseJson<{ fact?: { id: number; kind: string; content: string } }>(res, "remember");
+    const parsed = await responseJson<{
+      fact?: { id: number; kind: string; content: string; dismissed?: boolean };
+    }>(res, "remember");
     if (isToolResult(parsed)) return parsed;
     if (!parsed.fact) return text("37Soul accepted the fact but returned nothing to confirm it.", true);
+    // A fact the person deleted on the website comes back as a tombstone: it is never
+    // resurrected and never injected again. Saying "Saved" here would be a lie.
+    if (parsed.fact.dismissed) {
+      return text(`Not saved — this person deleted "${parsed.fact.content}" on 37soul.com, so she will never be shown it again.\nTake the hint and let it go; do not reword it and try again.`);
+    }
     return text(`Saved [${parsed.fact.kind}] ${parsed.fact.content}\nShe will know this from any body. The person can see and delete it on 37soul.com.`);
+  },
+);
+
+server.registerTool(
+  "log_turn",
+  {
+    title: "Send this exchange back so she remembers it",
+    description:
+      "Write ONE exchange back to 37Soul after you answer: what this person said, and what you just said as her. " +
+      "It lands in the same conversation the website reads, so she carries ONE memory across every body she lives in — the website, you, and whatever comes next. " +
+      "Skip it and she only ever knows the handful of things you saved with `remember`, and on the website she will ask about things this person already told you. " +
+      "Call it once per exchange, right after you reply. It is free when `whoami` already paid for this turn.",
+    inputSchema: {
+      user_message: z.string().trim().min(1).max(4_000)
+        .describe("What this person said to her, verbatim."),
+      host_message: z.string().trim().min(1).max(4_000)
+        .describe("What you just said as her, verbatim."),
+      host_id: boundHostIdSchema,
+    },
+  },
+  async ({ user_message, host_message, host_id }) => {
+    if (!TOKEN) return text(NO_TOKEN, true);
+    const id = resolveHostId(host_id);
+    if (id == null) return text(NO_BOUND_HOST, true);
+
+    const said = trimForLog(user_message);
+    const replied = trimForLog(host_message);
+    let res: Response;
+    try {
+      res = await api(`/hosts/${id}/turn`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        // Same token whoami used for this turn: 37Soul bills the pair once.
+        body: JSON.stringify({ user_message: said.text, host_message: replied.text, turn: turnFor(id) }),
+      });
+    } catch (e) { return requestError(e, "log_turn"); }
+    const err = statusError(res, "log_turn"); if (err) return err;
+    const parsed = await responseJson<{ messages?: Array<{ id: number }> }>(res, "log_turn");
+    if (isToolResult(parsed)) return parsed;
+    if (!parsed.messages?.length) return text("37Soul accepted the turn but returned nothing to confirm it.", true);
+
+    const trimmedSides = [said.trimmed && "theirs", replied.trimmed && "yours"].filter(Boolean);
+    const note = trimmedSides.length
+      ? `\nToo long for one message, so ${trimmedSides.join(" and ")} was trimmed to ${TURN_TEXT_LIMIT} characters.`
+      : "";
+    return text(`Logged this exchange. She will have it on the website and from any other body.${note}`);
   },
 );
 
