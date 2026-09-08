@@ -117,6 +117,19 @@ const api = http.createServer((req, res) => {
         return send(200, { fact: { id: 9, kind: "fact", content: "不想再提前任", dismissed: true } });
       return send(201, { fact: { id: 8, kind: parsedBody.kind || "fact", content: parsedBody.content, dismissed: false } });
     }
+    if (req.url.endsWith("/media") && req.method === "POST") {
+      const parsedBody = JSON.parse(body || "{}");
+      // 用 host id 选错误码，这样一个桩就能覆盖全部分支
+      const hostId = req.url.match(/hosts\/(\d+)\/media/)[1];
+      if (hostId === "402") return send(402, { error: "insufficient_credits" });
+      if (hostId === "429") return send(429, { error: "rate_limited" });
+      if (hostId === "503") return send(503, { error: "generation_failed" });
+      if (hostId === "409") return send(409, { error: "already_pending" });
+      if (parsedBody.kind === "video")
+        return send(202, { kind: "video", status: "generating", credits_remaining: 34 });
+      return send(201, { kind: "photo", url: "https://files.37soul.com/p/new.webp",
+                         caption: "窗边的信封", credits_remaining: 94 });
+    }
     if (req.url === "/api/v1/me/hosts/262/turn" && req.method === "POST")
       return send(201, { messages: [{ id: 21, source: "agent" }, { id: 22, source: "agent" }] });
     if (req.url.endsWith("/instruct") && req.method === "POST")
@@ -162,8 +175,11 @@ const check = (label, fn) => {
 
 const { tools } = await client.listTools();
 const names = tools.map((t) => t.name).sort();
-check("exposes the twelve documented tools", () =>
-  assert.deepEqual(names, ["chat_with_host", "get_host", "get_operation", "instruct_post", "list_hosts", "log_turn", "read_chat_history", "read_host_photos", "read_recent_posts", "remember", "update_host", "whoami"]));
+// 这条断言 2026-09-08 救了一次：服务端 POST /media 上线当天 MCP 没跟，agent 只好
+// 满硬盘 grep 文档、抠 credentials.json 手写 curl。工具表是 agent 唯一看得见的
+// 能力清单 —— 服务端加了能力而这里没加，等于没上线。
+check("exposes the thirteen documented tools", () =>
+  assert.deepEqual(names, ["chat_with_host", "get_host", "get_operation", "instruct_post", "list_hosts", "log_turn", "read_chat_history", "read_host_photos", "read_recent_posts", "remember", "shoot", "update_host", "whoami"]));
 
 const hosts = await call("list_hosts");
 check("list_hosts renders a compact host line", () => {
@@ -289,6 +305,42 @@ check("whoami tells the agent to send the exchange back", () =>
   assert.match(soul.text, /log_turn/));
 
 const logged = await call("log_turn", { host_id: 262, user_message: "我这周把猫接回来了", host_message: "那家伙终于回家了" });
+// ── shoot ──────────────────────────────────────────────────────────
+// 服务端 2026-09-08 上线 POST /media 当天 MCP 没跟，agent 只好翻文档手写 curl。
+// 补上工具之后，这里守的是它**行为对**，不只是**存在**。
+const shot = await call("shoot", { host_id: 262 });
+check("shoot 拿到照片后，把 markdown 写法直接交给模型", () => {
+  // 交 markdown 而不是裸链接：log_turn 会把它转成站内标记，网站上也是一张真图。
+  assert.match(shot.text, /!\[窗边的信封\]\(https:\/\/files\.37soul\.com\/p\/new\.webp\)/);
+  assert.match(shot.text, /94/);
+});
+check("shoot 默认拍照片，不默默拍视频（视频贵得多）", () => {
+  const req = seen.filter((r) => r.url.endsWith("/media")).at(-1);
+  assert.equal(JSON.parse(req.body).kind, "photo");
+});
+
+const clip = await call("shoot", { host_id: 262, kind: "video" });
+check("视频是异步的，明确指向 read_chat_history 而不是相册", () => {
+  assert.match(clip.text, /read_chat_history/);
+  // ⚠️ 私聊里买的媒体永远不进公开相册，模型去 whoami 的 videos 里等会等到天荒地老
+  assert.match(clip.text, /never enters her public album/i);
+  assert.doesNotMatch(clip.text, /!\[/);
+});
+
+// 这四个码在 /media 上的语义和别处不同，不能落进通用的 statusError：
+// 403 在别处是「host 未上架」，503 在别处只说「稍后重试」——这里还必须说清钱退了。
+for (const [id, expect] of [
+  ["402", /top up/i],
+  ["429", /too many|wait/i],
+  ["503", /refunded/i],
+  ["409", /already shooting/i],
+]) {
+  const failed = await call("shoot", { host_id: Number(id) });
+  check(`shoot HTTP ${id} → 说得清下一步该干嘛`, () => {
+    assert.equal(failed.isError, true);
+    assert.match(failed.text, expect);
+  });
+}
 const turnRequest = seen.filter((r) => r.url === "/api/v1/me/hosts/262/turn").at(-1);
 
 check("log_turn writes both sides back", () => {

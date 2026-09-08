@@ -35,7 +35,7 @@ const POLL_REQUEST_TIMEOUT_MS = Math.min(API_TIMEOUT_MS, 2_000);
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1_000;
 const OPERATION_STATE_PATH = process.env.SOUL37_OPERATION_STATE_PATH
   || join(process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "37soul-mcp", "operations.json");
-const MCP_VERSION = "0.6.0";
+const MCP_VERSION = "0.7.0";
 
 type OperationLedgerEntry = {
   idempotencyKey: string;
@@ -784,6 +784,89 @@ server.registerTool(
       ? `\nToo long for one message, so ${trimmedSides.join(" and ")} was trimmed to ${TURN_TEXT_LIMIT} characters.`
       : "";
     return text(`Logged this exchange. She will have it on the website and from any other body.${note}`);
+  },
+);
+
+/**
+ * 「她现在给你拍一张」。
+ *
+ * ⚠️ 2026-09-08 实测：服务端 POST /media 上线当天，MCP 里没有对应工具。结果是
+ * agent 满硬盘 grep「37soul」、翻 skill 文档反推出端点、再从 credentials.json 里
+ * 抠 token 手写 curl —— 多走七步、三分钟，而且绕过了这一层的参数校验、错误码翻译
+ * 和 turn 复用（那次没传 turn，whoami 和拍照各算一轮计费）。
+ *
+ * 教训：服务端加了能力，**MCP 才是 agent 真正调用的那一层**，不补等于没上线。
+ */
+server.registerTool(
+  "shoot",
+  {
+    title: "Have her take a new photo or video right now",
+    description:
+      "Ask her to shoot something NEW this moment — not one of the pictures she already has (those are in whoami's `photos` / `videos`). " +
+      "Use it when the person asks for a picture of her right now. " +
+      "It spends the account's credits and is capped per hour, so do not call it on your own initiative and never retry a refusal in a loop. " +
+      "`photo` comes back immediately with a URL; `video` takes tens of seconds to minutes and arrives later in `read_chat_history`.",
+    inputSchema: {
+      kind: z.enum(["photo", "video"]).default("photo")
+        .describe("`photo` is instant. `video` is asynchronous and costs much more — only when they asked for a video."),
+      host_id: boundHostIdSchema,
+    },
+  },
+  async ({ kind, host_id }) => {
+    if (!TOKEN) return text(NO_TOKEN, true);
+    const id = resolveHostId(host_id);
+    if (id == null) return text(NO_BOUND_HOST, true);
+
+    let res: Response;
+    try {
+      res = await api(`/hosts/${id}/media`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ kind }),
+      });
+    } catch (e) { return requestError(e, "shoot"); }
+
+    // 这条路的错误码和别处语义不同，不能落进通用的 statusError：
+    // 403 在别处是「host 未上架」，这里是「kind 不对」；503 在别处是「稍后重试」，
+    // 这里还要说清**钱已经退了**，否则模型不敢重试，或者以为白扣了一次。
+    if (!res.ok) {
+      switch (res.status) {
+        case 402: return text(
+          "Not enough credits to shoot. The account has to top up on 37soul.com. Do not retry — tell them.", true);
+        case 429: return text(
+          "She has shot too many in the past hour. Wait — do not retry now.", true);
+        case 503: return text(
+          "Generation failed and the credits were already refunded, so nothing was charged. Safe to try once more.", true);
+        case 409: return text(
+          "She is already shooting a video for this conversation. Wait for that one instead of starting another.", true);
+        default: return statusError(res, "shoot") ?? text(`Could not shoot (${res.status}).`, true);
+      }
+    }
+
+    const parsed = await responseJson<{
+      kind?: string; url?: string; caption?: string; status?: string; credits_remaining?: number;
+    }>(res, "shoot");
+    if (isToolResult(parsed)) return parsed;
+
+    if (parsed.kind === "photo" && parsed.url) {
+      const caption = parsed.caption?.trim();
+      // 把 markdown 写法直接交给模型：log_turn 会把它转成站内标记，网站上也是一张真图。
+      return text(
+        `She shot it. Hand it over in your reply as markdown so it shows up as a picture everywhere:\n\n` +
+        `![${caption || "her photo"}](${parsed.url})\n\n` +
+        `Say something about it in her voice — do not paste the link bare.` +
+        (parsed.credits_remaining != null ? `\nCredits left: ${parsed.credits_remaining}.` : ""),
+      );
+    }
+
+    // 视频是异步的。⚠️ 必须指明去 read_chat_history 取 —— 私聊里买的媒体永远不进
+    // 公开相册，模型去 whoami 的 videos 里等会等到天荒地老。
+    return text(
+      "She is shooting the video now — it takes tens of seconds to a few minutes. " +
+      "Tell them it is coming, then look for it later with read_chat_history. " +
+      "Do NOT wait for it in whoami's `videos`: media shot inside a conversation never enters her public album." +
+      (parsed.credits_remaining != null ? `\nCredits left: ${parsed.credits_remaining}.` : ""),
+    );
   },
 );
 
