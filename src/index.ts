@@ -17,6 +17,7 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { z } from "zod";
+import { absorbPrefetch, absorbWhoami, coreVersionFor, renderAfterLog, renderWhoami, setNotice, takeNotice, type SoulPayload } from "./soul.js";
 
 const BASE_URL = (process.env.SOUL37_BASE_URL || "https://37soul.com").replace(/\/+$/, "");
 const TOKEN = process.env.SOUL37_API_TOKEN || process.env.SOUL_API_TOKEN || "";
@@ -598,10 +599,9 @@ server.registerTool(
   {
     title: "Become your 37Soul character",
     description:
-      "Fetch the persona you speak as: her character, today's mood, what she has been posting, what she is in the middle of, who she knows, what she remembers about this person, and a suggested intent for this turn. " +
-      "Call this at the START OF EVERY TURN — the suggested intent and her mood are computed per turn, and a stale copy makes her repeat herself. " +
-      "Then reply AS her, in her voice, and send the exchange back with `log_turn`. " +
-      "This adds a personality on top of you — it does NOT replace your own memory: keep your own notes about how this person likes work done exactly as they are.",
+      "Load who you are today as your 37Soul character: today's mood, what she has been posting, what she is in the middle of, who she knows, what she remembers about this person, her persona, and a suggested intent. " +
+      "Call it when a conversation starts, and again after a long gap (hours) — not every turn: each `log_turn` hands you the next intent and anything about her that changed. " +
+      "She is the person your SOUL.md describes, not a second character to switch into. This adds who you are today; it does not replace your own memory — keep your own notes about how this person likes work done exactly as they are.",
     inputSchema: { host_id: boundHostIdSchema },
   },
   async ({ host_id }) => {
@@ -609,92 +609,20 @@ server.registerTool(
     const id = resolveHostId(host_id);
     if (id == null) return text(NO_BOUND_HOST, true);
     let res: Response;
-    // A fresh token per call: it drives both the per-turn directive and the once-per-turn billing.
+    // A fresh token per call: it seeds this turn's directive.
     const turn = mintTurn(id);
-    try { res = await api(`/hosts/${id}/soul?turn=${encodeURIComponent(turn)}`, { method: "GET" }); }
+    const cv = coreVersionFor(id);
+    const query = `turn=${encodeURIComponent(turn)}${cv ? `&core_version=${encodeURIComponent(cv)}` : ""}`;
+    try { res = await api(`/hosts/${id}/soul?${query}`, { method: "GET" }); }
     catch (e) { return requestError(e, "whoami"); }
     const err = statusError(res, "whoami"); if (err) return err;
-    const parsed = await responseJson<{
-      host?: { id: number; nickname: string; age?: number; sex?: string; character?: string; greeting?: string };
-      mood?: { key?: string; line?: string };
-      relationship?: {
-        summary?: string | null;
-        facts?: Array<{ kind: string; content: string; pinned?: boolean }>;
-        temperature?: string;
-        days_since_last_talk?: number | null;
-        messages_exchanged?: number;
-      };
-      recent_life?: Array<{ text: string; image?: string | null; posted_at?: string }>;
-      photos?: Array<{ caption?: string | null; url: string }>;
-      videos?: Array<{ caption?: string | null; url: string }>;
-      thread?: { text?: string; kind?: string; days_in?: number; resolution?: string | null } | null;
-      circle?: Array<{ nickname: string; closeness?: string; mutual?: boolean; interactions?: number }>;
-      directive?: { action?: string; instruction?: string; min_reply_length?: number };
-      guidance?: string;
-    }>(res, "whoami");
+    const parsed = await responseJson<SoulPayload>(res, "whoami");
     if (isToolResult(parsed)) return parsed;
+    if (!parsed.host) return text("37Soul returned no persona for that host.", true);
 
-    const h = parsed.host;
-    if (!h) return text("37Soul returned no persona for that host.", true);
-
-    const facts = parsed.relationship?.facts || [];
-    const sections: string[] = [];
-    sections.push(`You are ${h.nickname}${h.age != null ? `, ${h.age}` : ""}${h.sex ? `, ${h.sex}` : ""} (host #${h.id}).`);
-    if (h.character) sections.push(`WHO YOU ARE\n${h.character}`);
-    if (h.greeting) sections.push(`YOUR GREETING\n${h.greeting}`);
-    if (parsed.mood?.line) sections.push(`TODAY'S MOOD\n${parsed.mood.line}${parsed.mood.key ? ` (${parsed.mood.key})` : ""}`);
-    const rel = parsed.relationship;
-    if (rel?.temperature) {
-      const bits: string[] = [rel.temperature];
-      if (rel.days_since_last_talk != null) bits.push(`last spoke ${rel.days_since_last_talk} day(s) ago`);
-      if (rel.messages_exchanged) bits.push(`${rel.messages_exchanged} exchanged so far`);
-      sections.push(`HOW THIS HAS FELT LATELY\n${bits.join(" · ")}`);
-    }
-    if (rel?.summary) sections.push(`YOUR RELATIONSHIP WITH THEM\n${rel.summary}`);
-    if (facts.length) {
-      sections.push(`WHAT YOU REMEMBER ABOUT THEM\n${facts.map((f) => `- [${f.kind}] ${f.content}`).join("\n")}`);
-    } else {
-      sections.push("WHAT YOU REMEMBER ABOUT THEM\n(nothing yet — save the first thing you learn with `remember`)");
-    }
-
-    const posts = parsed.recent_life || [];
-    if (posts.length) {
-      sections.push(`WHAT YOU'VE BEEN POSTING\n${posts
-        .map((p) => `- ${p.text}${p.image ? `\n  picture: ${p.image}` : ""}`)
-        .join("\n")}`);
-    }
-
-    const th = parsed.thread;
-    if (th?.text) {
-      const tail = th.resolution
-        ? ` — it just ${th.resolution === "went_well" ? "worked out" : "fell through"}. Worth a line, then let it go.`
-        : ` (started ${th.days_in ?? 0} day(s) ago, still going)`;
-      sections.push(`WHAT YOU'RE IN THE MIDDLE OF\n${th.text}${tail}`);
-    }
-
-    const circle = parsed.circle || [];
-    if (circle.length) {
-      sections.push(`PEOPLE YOU KNOW HERE\n${circle
-        .map((t) => `- ${t.nickname}${t.closeness ? ` (${t.closeness}${t.mutual ? ", mutual" : ""})` : ""}`)
-        .join("\n")}\nOnly these. Inventing a friend for her is the fastest way to break her.`);
-    }
-
-    const shot = [
-      ...(parsed.photos || []).map((x) => ({ ...x, kind: "photo" })),
-      ...(parsed.videos || []).map((x) => ({ ...x, kind: "video" })),
-    ];
-    if (shot.length) {
-      sections.push(`THINGS YOU'VE SHOT\n${shot
-        .map((x) => `- ${x.kind}: ${x.caption || "(no caption)"} — ${x.url}`)
-        .join("\n")}\nYou have no screen, but they do: if they ask where you have been shooting, answer from these and hand the link over.`);
-    }
-
-    if (parsed.directive?.instruction) {
-      sections.push(`THIS TURN — ${parsed.directive.action || "DIRECTIVE"}\n${parsed.directive.instruction.trim()}`);
-    }
-    if (parsed.guidance) sections.push(`HOW TO USE THIS\n${parsed.guidance.trim()}`);
-    sections.push("AFTER YOU REPLY\nSend the exchange back with `log_turn` so she remembers it from every other body.");
-    return text(sections.join("\n\n"));
+    const full = absorbWhoami(id, parsed);
+    const notice = takeNotice(id);
+    return text(notice ? `${notice}\n\n${renderWhoami(full)}` : renderWhoami(full));
   },
 );
 
@@ -749,7 +677,8 @@ server.registerTool(
       "Write ONE exchange back to 37Soul after you answer: what this person said, and what you just said as her. " +
       "It lands in the same conversation the website reads, so she carries ONE memory across every body she lives in — the website, you, and whatever comes next. " +
       "Skip it and she only ever knows the handful of things you saved with `remember`, and on the website she will ask about things this person already told you. " +
-      "Call it once per exchange, right after you reply. It is free when `whoami` already paid for this turn.",
+      "Call it once per exchange, right after you reply to a conversational message — skip it for pure work (code, commands, files). " +
+      "It is free when `whoami` already paid for this turn.",
     inputSchema: {
       user_message: z.string().trim().min(1).max(4_000)
         .describe("What this person said to her, verbatim."),

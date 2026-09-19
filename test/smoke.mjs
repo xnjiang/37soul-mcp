@@ -21,6 +21,12 @@ const operations = new Map();
 const operationsByKey = new Map();
 const seen = [];
 
+// 协议 v2：mock 的 /soul 带 you_are / core_version，并认 core_version 参数。
+const CORE_262 = "cv262";
+let soulMood = "今天有点想闹腾";
+let turnDelayMs = 0;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 const operation = (action, idempotencyKey) => {
   const existing = operationsByKey.get(`${action}:${idempotencyKey}`);
   if (existing) return { id: existing.id, action, status: "queued", result: {}, error: null };
@@ -91,10 +97,15 @@ const api = http.createServer((req, res) => {
       return send(200, { posts: [
         { id: 987, text: "凌晨三点的显示器", image: null, created_at: "2026-07-22T09:00:00Z" },
       ] });
-    if (req.url.startsWith("/api/v1/me/hosts/262/soul") && req.method === "GET")
+    if (req.url.startsWith("/api/v1/me/hosts/262/soul") && req.method === "GET") {
+      const unchanged = new URL(req.url, "http://x").searchParams.get("core_version") === CORE_262;
       return send(200, {
-        host: { id: 262, nickname: "Nyx", age: 25, sex: "female", character: "night owl illustrator", greeting: "hi" },
-        mood: { key: "playful", line: "今天有点想闹腾" },
+        you_are: "You are Nyx, 25, female (host #262) — the same person your SOUL.md describes; what follows is what is true of her today.",
+        host: unchanged
+          ? { id: 262, nickname: "Nyx", age: 25, sex: "female" }
+          : { id: 262, nickname: "Nyx", age: 25, sex: "female", character: "night owl illustrator", greeting: "hi" },
+        core_version: CORE_262,
+        mood: { key: "playful", line: soulMood },
         relationship: {
           summary: "聊过三次，主要聊工作",
           facts: [{ kind: "fact", content: "养了只叫 Mochi 的狗" }],
@@ -108,8 +119,11 @@ const api = http.createServer((req, res) => {
         thread: { text: "把那批照片重新洗一遍", kind: "doing", days_in: 2, resolution: null },
         circle: [{ nickname: "沈青", closeness: "familiar", mutual: true, interactions: 5 }],
         directive: { action: "SHARE", instruction: "THIS TURN — SHARE: bring up your own week.", min_reply_length: 150 },
+        // 后端终审裁定：guidance 每次都发（三条禁令管的是每次都发的字段），core_version 只省人设原文。
         guidance: "You are still yourself.",
+        ...(unchanged ? { core: "unchanged" } : {}),
       });
+    }
     if (req.url === "/api/v1/me/hosts/262/facts" && req.method === "POST") {
       const parsedBody = JSON.parse(body || "{}");
       // 用户在网页上删过的那条：服务端返回墓碑，不复活。
@@ -303,6 +317,26 @@ check("whoami renders her own life, not just her character", () => {
 
 check("whoami tells the agent to send the exchange back", () =>
   assert.match(soul.text, /log_turn/));
+
+// ── 协议 v2 · whoami ────────────────────────────────────────────────
+const soulUrls = () => seen.filter((r) => r.url.startsWith("/api/v1/me/hosts/262/soul")).map((r) => r.url);
+check("第一次 whoami 手上没有缓存，要完整的核心", () =>
+  assert.doesNotMatch(soulUrls()[0], /core_version=/));
+// 0.7 以前 MCP 从不转 you_are，自己拼一句 "You are Nyx"。服务端那句才带「你就是
+// SOUL.md 里那个人」和「名字对不上怎么办」，所以第一行必须是它。
+check("whoami 第一行是服务端的 you_are，不是本地拼的", () =>
+  assert.match(soul.text.split("\n")[0], /same person your SOUL\.md describes/));
+check("whoami 的说明不再要求每轮都调", () => {
+  const d = tools.find((t) => t.name === "whoami").description;
+  assert.match(d, /not every turn/i);
+  assert.doesNotMatch(d, /START OF EVERY TURN/);
+});
+check("log_turn 只给聊天用，干活的轮次不写", () =>
+  assert.match(tools.find((t) => t.name === "log_turn").description, /skip it for pure work/i));
+check("whoami 结尾不再说「每次都回写」，并且不许把回写说给对方听", () => {
+  assert.match(soul.text, /skip it for pure work/i);
+  assert.match(soul.text, /never mention saving or logging/i);
+});
 
 const logged = await call("log_turn", { host_id: 262, user_message: "我这周把猫接回来了", host_message: "那家伙终于回家了" });
 // ── shoot ──────────────────────────────────────────────────────────
