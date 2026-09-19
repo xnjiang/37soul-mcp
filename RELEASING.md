@@ -29,7 +29,9 @@ while npm reached 0.1.4, because the two publishes were independent manual steps
 
 3. **Publish to npm.** `cd` here first — `npm publish --prefix` does *not* work,
    it packages the current working directory instead. Expect
-   `37soul-mcp@<version>` and `total files: 4`.
+   `37soul-mcp@<version>` and `total files: 5` — confirm `dist/soul.js` is in the
+   list; if it's missing, the build didn't run and you're about to publish a
+   server that can't hold any persona state.
    ```sh
    npm publish --access public
    ```

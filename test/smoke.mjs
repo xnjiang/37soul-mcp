@@ -21,6 +21,18 @@ const operations = new Map();
 const operationsByKey = new Map();
 const seen = [];
 
+// 协议 v2：mock 的 /soul 带 you_are / core_version，并认 core_version 参数。
+let CORE_262 = "cv262"; // I4: 需要在测试中间改一次版本，验证「人设变了」的提醒
+let soulMood = "今天有点想闹腾";
+let turnDelayMs = 0;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// I1: 追踪 /turn 是否曾经并发在途 —— 在请求体读完（路由分支执行）时加一，
+// 在延迟响应发出之后减一。真正串行的写回永远看不到「加一时已经有一个在途」。
+let turnInFlight = 0;
+let turnOverlap = false;
+let host500Attempts = 0;
+
 const operation = (action, idempotencyKey) => {
   const existing = operationsByKey.get(`${action}:${idempotencyKey}`);
   if (existing) return { id: existing.id, action, status: "queued", result: {}, error: null };
@@ -91,10 +103,15 @@ const api = http.createServer((req, res) => {
       return send(200, { posts: [
         { id: 987, text: "凌晨三点的显示器", image: null, created_at: "2026-07-22T09:00:00Z" },
       ] });
-    if (req.url.startsWith("/api/v1/me/hosts/262/soul") && req.method === "GET")
+    if (req.url.startsWith("/api/v1/me/hosts/262/soul") && req.method === "GET") {
+      const unchanged = new URL(req.url, "http://x").searchParams.get("core_version") === CORE_262;
       return send(200, {
-        host: { id: 262, nickname: "Nyx", age: 25, sex: "female", character: "night owl illustrator", greeting: "hi" },
-        mood: { key: "playful", line: "今天有点想闹腾" },
+        you_are: "You are Nyx, 25, female (host #262) — the same person your SOUL.md describes; what follows is what is true of her today.",
+        host: unchanged
+          ? { id: 262, nickname: "Nyx", age: 25, sex: "female" }
+          : { id: 262, nickname: "Nyx", age: 25, sex: "female", character: "night owl illustrator", greeting: "hi" },
+        core_version: CORE_262,
+        mood: { key: "playful", line: soulMood },
         relationship: {
           summary: "聊过三次，主要聊工作",
           facts: [{ kind: "fact", content: "养了只叫 Mochi 的狗" }],
@@ -107,14 +124,41 @@ const api = http.createServer((req, res) => {
         videos: [{ caption: "风车", url: "https://files.example/mill.mp4" }],
         thread: { text: "把那批照片重新洗一遍", kind: "doing", days_in: 2, resolution: null },
         circle: [{ nickname: "沈青", closeness: "familiar", mutual: true, interactions: 5 }],
-        directive: { action: "SHARE", instruction: "THIS TURN — SHARE: bring up your own week.", min_reply_length: 150 },
+        directive: {
+          action: "SHARE",
+          instruction: "---\nTHIS TURN — SHARE: Answer them briefly, then bring up something from your own week.",
+          min_reply_length: 150,
+        },
+        // 后端终审裁定：guidance 每次都发（三条禁令管的是每次都发的字段），core_version 只省人设原文。
         guidance: "You are still yourself.",
+        ...(unchanged ? { core: "unchanged" } : {}),
       });
+    }
+    // I3: 402 host 的 /soul，同样的形状，不一样的名字 —— 用来验证提示排在身份之后，
+    // you_are 仍然是第一行。
+    if (req.url.startsWith("/api/v1/me/hosts/402/soul") && req.method === "GET") {
+      return send(200, {
+        you_are: "You are Rae, 24, female (host #402) — the same person your SOUL.md describes; what follows is what is true of her today.",
+        host: { id: 402, nickname: "Rae", age: 24, sex: "female", character: "quiet baker", greeting: "hey" },
+        core_version: "cv402",
+        mood: { key: "calm", line: "还行" },
+        relationship: { summary: null, facts: [], temperature: "new", days_since_last_talk: null, messages_exchanged: 0 },
+      });
+    }
     if (req.url === "/api/v1/me/hosts/262/facts" && req.method === "POST") {
       const parsedBody = JSON.parse(body || "{}");
       // 用户在网页上删过的那条：服务端返回墓碑，不复活。
       if (parsedBody.content === "不想再提前任")
         return send(200, { fact: { id: 9, kind: "fact", content: "不想再提前任", dismissed: true } });
+      // M10: TaskFactGate 拒收的任务型事实 —— 422 带改写建议，不是通用报错。
+      if (parsedBody.content === "run bin/render-build.sh to deploy")
+        return send(422, {
+          error: "This looks like a task fact, not something about the person.",
+          matched: ["shell_command", "source_extension"],
+          hint: "Build commands, code style and tooling belong in your own memory, not hers. If this really " +
+                "is about them — e.g. \"they are building a project called render-build\" — say it as a sentence " +
+                "about the person and send it again.",
+        });
       return send(201, { fact: { id: 8, kind: parsedBody.kind || "fact", content: parsedBody.content, dismissed: false } });
     }
     if (req.url.endsWith("/media") && req.method === "POST") {
@@ -130,8 +174,21 @@ const api = http.createServer((req, res) => {
       return send(201, { kind: "photo", url: "https://files.37soul.com/p/new.webp",
                          caption: "窗边的信封", credits_remaining: 94 });
     }
-    if (req.url === "/api/v1/me/hosts/262/turn" && req.method === "POST")
-      return send(201, { messages: [{ id: 21, source: "agent" }, { id: 22, source: "agent" }] });
+    if (req.url === "/api/v1/me/hosts/262/turn" && req.method === "POST") {
+      if (turnInFlight > 0) turnOverlap = true;
+      turnInFlight++;
+      return setTimeout(() => {
+        send(201, { messages: [{ id: 21, source: "agent" }, { id: 22, source: "agent" }] });
+        turnInFlight--;
+      }, turnDelayMs);
+    }
+    if (req.url === "/api/v1/me/hosts/402/turn" && req.method === "POST")
+      return send(402, { error: "Out of messages" });
+    if (req.url === "/api/v1/me/hosts/500/turn" && req.method === "POST") {
+      host500Attempts++;
+      if (host500Attempts === 1) return send(500, { error: "boom" });
+      return send(201, { messages: [] });
+    }
     if (req.url.endsWith("/instruct") && req.method === "POST")
       return send(202, { operation: operation("post", String(req.headers["idempotency-key"])) });
     send(404, { error: "nope" });
@@ -149,12 +206,12 @@ const serverEnv = {
   SOUL37_OPERATION_STATE_PATH: statePath,
 };
 
-const connectClient = async (name) => {
+const connectClient = async (name, extraEnv = {}) => {
   const client = new Client({ name, version: "1" });
   await client.connect(new StdioClientTransport({
     command: "node",
     args: [SERVER],
-    env: serverEnv,
+    env: { ...serverEnv, ...extraEnv },
     stderr: "ignore",
   }));
   return client;
@@ -304,7 +361,111 @@ check("whoami renders her own life, not just her character", () => {
 check("whoami tells the agent to send the exchange back", () =>
   assert.match(soul.text, /log_turn/));
 
+check("whoami 的 THIS TURN 正文里站内格式已经洗掉了", () => {
+  const thisTurnSection = soul.text.split("\n\n").find((section) => section.startsWith("THIS TURN —"));
+  assert.ok(thisTurnSection, "no THIS TURN section rendered");
+  assert.doesNotMatch(thisTurnSection, /---/);
+  assert.doesNotMatch(thisTurnSection, /THIS TURN — SHARE:/); // 前缀只在标题行，不在正文里重复
+});
+
+// ── 协议 v2 · whoami ────────────────────────────────────────────────
+const soulUrls = () => seen.filter((r) => r.url.startsWith("/api/v1/me/hosts/262/soul")).map((r) => r.url);
+check("第一次 whoami 手上没有缓存，要完整的核心", () =>
+  assert.doesNotMatch(soulUrls()[0], /core_version=/));
+// 0.7 以前 MCP 从不转 you_are，自己拼一句 "You are Nyx"。服务端那句才带「你就是
+// SOUL.md 里那个人」和「名字对不上怎么办」，所以第一行必须是它。
+check("whoami 第一行是服务端的 you_are，不是本地拼的", () =>
+  assert.match(soul.text.split("\n")[0], /same person your SOUL\.md describes/));
+check("whoami 的说明不再要求每轮都调", () => {
+  const d = tools.find((t) => t.name === "whoami").description;
+  assert.match(d, /not every turn/i);
+  assert.doesNotMatch(d, /START OF EVERY TURN/);
+});
+check("log_turn 只给聊天用，干活的轮次不写", () =>
+  assert.match(tools.find((t) => t.name === "log_turn").description, /skip it for pure work/i));
+check("whoami 结尾不再说「每次都回写」，并且不许把回写说给对方听", () => {
+  assert.match(soul.text, /skip it for pure work/i);
+  assert.match(soul.text, /never mention saving or logging/i);
+});
+
+// ── 协议 v2 · log_turn ──────────────────────────────────────────────
+// 等 whoami 之后那次后台预取落地，再改她的心情 —— 下一次预取才会看到变化。
+await sleep(300);
+soulMood = "有点累，但挺安静";
+turnDelayMs = 1500;
+const loggedAt = Date.now();
 const logged = await call("log_turn", { host_id: 262, user_message: "我这周把猫接回来了", host_message: "那家伙终于回家了" });
+const loggedTook = Date.now() - loggedAt;
+check("log_turn 不等网络（写回在后台）", () => assert.ok(loggedTook < 700, `took ${loggedTook}ms`));
+check("log_turn 明说不许告诉对方", () => assert.match(logged.text, /do not mention this to them/i));
+check("log_turn 再钉一次她是谁", () => assert.match(logged.text, /You are Nyx/));
+check("log_turn 交出下一轮的意图，说明是下一句不是这一句", () =>
+  assert.match(logged.text, /For your NEXT reply \(not the one you are finishing now\) — SHARE/));
+check("log_turn 的下一轮意图带上这周的素材", () =>
+  assert.match(logged.text, /\(from your week: 今天把稿子改完了\)/));
+check("log_turn 的下一轮意图里站内格式已经洗掉了", () => {
+  assert.doesNotMatch(logged.text, /---/);
+  assert.doesNotMatch(logged.text, /THIS TURN —/);
+});
+await sleep(2000);
+const logged2 = await call("log_turn", { host_id: 262, user_message: "你今天怎么样", host_message: "有点累，不过还好" });
+check("她变了什么，跟着 log_turn 回来", () => assert.match(logged2.text, /有点累，但挺安静/));
+await sleep(2000);
+turnDelayMs = 0;
+check("后台预取带着 core_version，人设不重发", () => assert.match(soulUrls().at(-1), /core_version=cv262/));
+
+// ── I1: 同一个角色的后台写回排队 ──────────────────────────────────
+turnDelayMs = 800;
+turnInFlight = 0;
+turnOverlap = false;
+const serializedAt = Date.now();
+const [logA, logB] = await Promise.all([
+  call("log_turn", { host_id: 262, user_message: "queue one", host_message: "reply one" }),
+  call("log_turn", { host_id: 262, user_message: "queue two", host_message: "reply two" }),
+]);
+check("两次 log_turn 都立即返回，不等排队里的写回", () => {
+  assert.equal(logA.isError, false);
+  assert.equal(logB.isError, false);
+  assert.ok(Date.now() - serializedAt < 700);
+});
+await sleep(2200); // 两次 800ms 的写回严格串行需要 ~1600ms+，留够余量
+check("同一个角色的后台写回严格排队，不会并发在途", () => assert.equal(turnOverlap, false));
+check("两次写回按 log_turn 的调用顺序落地", () => {
+  const queueRequests = seen.filter((r) => r.url === "/api/v1/me/hosts/262/turn" && r.method === "POST");
+  const indexOne = queueRequests.findIndex((r) => r.body.includes("queue one"));
+  const indexTwo = queueRequests.findIndex((r) => r.body.includes("queue two"));
+  assert.ok(indexOne !== -1 && indexTwo !== -1);
+  assert.ok(indexOne < indexTwo);
+});
+turnDelayMs = 0;
+
+const retryAt = Date.now();
+const retried = await call("log_turn", { host_id: 500, user_message: "retry me", host_message: "ok" });
+check("会先失败一次的写回也立即返回", () => {
+  assert.equal(retried.isError, false);
+  assert.ok(Date.now() - retryAt < 700);
+});
+await sleep(1500);
+check("重试复用同一个 turn，而不是铸一个新的", () => {
+  const retryRequests = seen.filter((r) => r.url === "/api/v1/me/hosts/500/turn" && r.method === "POST");
+  assert.equal(retryRequests.length, 2);
+  const turns = retryRequests.map((r) => JSON.parse(r.body).turn);
+  assert.equal(turns[0], turns[1]);
+});
+
+// ── I4: 隔久了没读 whoami，log_turn 要提醒 ────────────────────────
+// 独立进程、独立状态：只有它自己看得见自己的 lastWhoamiAt，不跟主流程的 host 262 state 打架。
+const staleClient = await connectClient("stale-whoami", { SOUL37_WHOAMI_STALE_MS: "1000" });
+const staleCall = async (name, args = {}) => {
+  const r = await staleClient.callTool({ name, arguments: args });
+  return { text: r.content[0].text, isError: !!r.isError };
+};
+await staleCall("whoami", { host_id: 262 });
+await sleep(1200);
+const staleLogged = await staleCall("log_turn", { host_id: 262, user_message: "hi", host_message: "hey" });
+check("隔久了没读 whoami，log_turn 提醒重新读", () => assert.match(staleLogged.text, /call whoami/i));
+await staleClient.close();
+
 // ── shoot ──────────────────────────────────────────────────────────
 // 服务端 2026-09-08 上线 POST /media 当天 MCP 没跟，agent 只好翻文档手写 curl。
 // 补上工具之后，这里守的是它**行为对**，不只是**存在**。
@@ -368,17 +529,41 @@ check("402 明确禁用「账户/额度/充值」这几个词", async () => {
   const failed = await call("shoot", { host_id: 402 });
   assert.match(failed.text, /Do not say .*account.*credits.*top up/i);
 });
-const turnRequest = seen.filter((r) => r.url === "/api/v1/me/hosts/262/turn").at(-1);
-
 check("log_turn writes both sides back", () => {
-  assert.match(logged.text, /Logged this exchange/);
-  assert.match(turnRequest.body, /我这周把猫接回来了/);
-  assert.match(turnRequest.body, /那家伙终于回家了/);
+  const turnRequests = seen.filter((r) => r.url === "/api/v1/me/hosts/262/turn");
+  const first = turnRequests.find((r) => r.body.includes("我这周把猫接回来了"));
+  assert.ok(first, "the first exchange never reached /turn");
+  assert.match(first.body, /那家伙终于回家了/);
 });
 
-check("log_turn reuses the turn whoami paid for, so the exchange is billed once", () => {
-  const soulTurn = new URL(soulRequest.url, "http://x").searchParams.get("turn");
-  assert.equal(JSON.parse(turnRequest.body).turn, soulTurn);
+// 协议 v2：计费只在写回上，turn 是它的幂等键 —— 每一轮都得是新的。
+check("每次写回都带自己的 turn", () => {
+  const turns = seen.filter((r) => r.url === "/api/v1/me/hosts/262/turn").map((r) => JSON.parse(r.body).turn);
+  assert.ok(turns.length >= 2);
+  assert.equal(new Set(turns).size, turns.length);
+});
+
+const deniedAt = Date.now();
+const denied = await call("log_turn", { host_id: 402, user_message: "a", host_message: "b" });
+check("写回会被拒也照样立即返回", () => {
+  assert.equal(denied.isError, false);
+  assert.ok(Date.now() - deniedAt < 700);
+});
+await sleep(300); // 让刚才那次写回落地、转成 "refused"，提示挂起
+const soul402 = await call("whoami", { host_id: 402 });
+check("提示挂起时，whoami 第一行仍然是 you_are，不是提示", () =>
+  assert.match(soul402.text.split("\n")[0], /Rae/));
+check("第一次转进 refused：下一次调用（这里是 whoami）说一次「没存上」", () => {
+  assert.match(soul402.text, /An earlier exchange was not saved/);
+  assert.match(soul402.text, /do not retry/);
+});
+
+const afterDenied = await call("log_turn", { host_id: 402, user_message: "c", host_message: "d" });
+await sleep(300); // 这次写回同样 402，但状态没变（还是 refused）——不应该再提一次
+const afterDenied2 = await call("log_turn", { host_id: 402, user_message: "e", host_message: "f" });
+check("再来的 402 不会重复提示", () => {
+  assert.doesNotMatch(afterDenied.text, /was not saved/i);
+  assert.doesNotMatch(afterDenied2.text, /was not saved/i);
 });
 
 const soul2 = await call("whoami", { host_id: 262 });
@@ -389,7 +574,28 @@ check("consecutive whoami calls do not reuse one turn token", () => {
   assert.ok(soul2.text.length > 0);
 });
 
+// 协议 v2 的部分加载：第二次读带上缓存的 core_version，服务端回 core:"unchanged"、
+// 不带人设原文 —— 渲染出来的她必须还是完整的（从缓存补回），因为一个 MCP 进程
+// 会跨很多段对话，新对话里第一次 whoami 不能没有她是谁。
+check("第二次 whoami 带 core_version，服务端省掉人设，渲染仍从缓存补全", () => {
+  const url = seen.filter((r) => r.url.startsWith("/api/v1/me/hosts/262/soul")).at(-1).url;
+  assert.match(url, /core_version=cv262/);
+  assert.match(soul2.text, /WHO YOU ARE\nnight owl illustrator/);
+  assert.match(soul2.text, /YOUR GREETING\nhi/);
+});
+
+// ── I4: 人设变了要提醒 ─────────────────────────────────────────────
+// 这个 client 手里缓存的 core_version 还是 cv262（上面两次 whoami 都没有改过它）。
+// 现在把服务端的「当前版本」换掉，模拟「人设在别处被改了」：下一次写回触发的后台
+// 预取会带回新版本号，发现跟 shownCoreVersion 对不上，下下次 log_turn 就该提醒。
+CORE_262 = "cv262-v2";
+await call("log_turn", { host_id: 262, user_message: "core change 1", host_message: "core change 1 reply" });
+await sleep(500); // 让这次写回成功、触发的后台预取落地（拿到新版本号）
+const afterCoreChange = await call("log_turn", { host_id: 262, user_message: "core change 2", host_message: "core change 2 reply" });
+check("人设变了，log_turn 提醒重新读 whoami", () => assert.match(afterCoreChange.text, /Her persona changed/));
+
 const longTurn = await call("log_turn", { host_id: 262, user_message: "hi", host_message: "x".repeat(1200) });
+await sleep(300);
 check("log_turn says which side it trimmed", () => {
   assert.match(longTurn.text, /trimmed to 800/);
   assert.equal(JSON.parse(seen.filter((r) => r.url === "/api/v1/me/hosts/262/turn").at(-1).body).host_message.length, 800);
@@ -404,6 +610,13 @@ check("remember does not claim to have saved a fact the person deleted", () => {
   assert.match(tombstoned.text, /deleted/);
 });
 
+// M10: TaskFactGate 的 422 带改写建议，remember 要把它转述出来，而不是回通用报错。
+const taskFact = await call("remember", { host_id: 262, content: "run bin/render-build.sh to deploy" });
+check("remember 转述 422 的改写建议，而不是通用的 Invalid parameters", () => {
+  assert.ok(taskFact.isError);
+  assert.match(taskFact.text, /Build commands, code style and tooling belong in your own memory/i);
+  assert.doesNotMatch(taskFact.text, /^Invalid parameters for remember\.$/);
+});
 
 const errorCases = [
   [401, "instruct_post", /token/i],

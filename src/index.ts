@@ -3,7 +3,7 @@
  * 37Soul MCP server — operate your 37Soul account from any MCP client.
  * Tools: list_hosts | get_host | update_host | read_host_photos | chat_with_host |
  *        read_chat_history | read_recent_posts | instruct_post | get_operation |
- *        whoami | remember | log_turn.
+ *        whoami | remember | log_turn | shoot.
  * Auth: SOUL37_API_TOKEN (SOUL_API_TOKEN remains a compatibility alias).
  * Base: SOUL37_BASE_URL (default https://37soul.com).
  * Bind:  SOUL37_HOST_ID (optional) — pin this server to one host so `whoami`,
@@ -17,6 +17,7 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { z } from "zod";
+import { absorbPrefetch, absorbWhoami, coreVersionFor, recordSaveOutcome, renderAfterLog, renderWhoami, takeNotice, type SoulPayload } from "./soul.js";
 
 const BASE_URL = (process.env.SOUL37_BASE_URL || "https://37soul.com").replace(/\/+$/, "");
 const TOKEN = process.env.SOUL37_API_TOKEN || process.env.SOUL_API_TOKEN || "";
@@ -32,10 +33,15 @@ const API_TIMEOUT_MS = Number.isFinite(configuredTimeout) && configuredTimeout >
   ? Math.min(configuredTimeout, 300_000)
   : 20_000;
 const POLL_REQUEST_TIMEOUT_MS = Math.min(API_TIMEOUT_MS, 2_000);
+// The background /turn write is off the interactive critical path — nothing is waiting on
+// it — so it should not inherit a short SOUL37_API_TIMEOUT_MS tuned for snappy foreground
+// calls. Give it its own floor — and a ceiling, so a very long SOUL37_API_TIMEOUT_MS
+// (configured for some other slow tool) can't leave a background write hanging forever.
+const WRITE_TIMEOUT_MS = Math.min(Math.max(API_TIMEOUT_MS, 10_000), 30_000);
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1_000;
 const OPERATION_STATE_PATH = process.env.SOUL37_OPERATION_STATE_PATH
   || join(process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "37soul-mcp", "operations.json");
-const MCP_VERSION = "0.7.2";
+const MCP_VERSION = "0.8.0";
 
 type OperationLedgerEntry = {
   idempotencyKey: string;
@@ -224,32 +230,16 @@ function resolveHostId(explicit?: number): number | null {
 const NO_BOUND_HOST = "No host selected. Either pass host_id, or set SOUL37_HOST_ID in this server's env to bind it to one character. Use list_hosts to find the id.";
 
 /**
- * One exchange = one `turn` token, shared by `whoami` and `log_turn`.
- *
- * 37Soul uses it for two things at once:
- *   - Billing. A turn is charged once; whichever of the two calls arrives first
- *     pays and the other is free. Without a token the server cannot tell two
- *     calls apart and bills each one as its own turn.
- *   - `directive`. The token is a seed input, so the suggested intent changes
- *     from turn to turn. Without it a binding gets the same intent forever.
- *
- * The agent never has to carry it: `whoami` mints a fresh one per call, and
- * `log_turn` reuses whatever `whoami` last minted for that host. An agent that
- * writes back without ever calling `whoami` simply mints (and pays for) its own.
+ * `turn` 是一次写回的计费幂等键（协议 v2：计费只在 /turn 上）。每次 log_turn 都新铸一个，
+ * 后台重试复用同一个 —— 服务端对同一个 turn 只收一次。whoami 和预取也各铸一个，
+ * 只用来给「这一轮的意图」当种子。
  */
 const TURN_NONCE = randomUUID().slice(0, 8);
 let turnCounter = 0;
-const currentTurn = new Map<number, string>();
 
-function mintTurn(hostId: number): string {
+function mintTurn(): string {
   turnCounter += 1;
-  const token = `${TURN_NONCE}-${turnCounter}`;
-  currentTurn.set(hostId, token);
-  return token;
-}
-
-function turnFor(hostId: number): string {
-  return currentTurn.get(hostId) || mintTurn(hostId);
+  return `${TURN_NONCE}-${turnCounter}`;
 }
 
 /** Chat rows cap at 800 characters server-side; trim loudly rather than lose the whole turn. */
@@ -259,6 +249,60 @@ function trimForLog(value: string): { text: string; trimmed: boolean } {
   const clean = value.trim();
   if (clean.length <= TURN_TEXT_LIMIT) return { text: clean, trimmed: false };
   return { text: `${clean.slice(0, TURN_TEXT_LIMIT - 1)}…`, trimmed: true };
+}
+
+/** 下一轮的她，趁模型还在写回复时从后台取好。失败不打扰任何人，但要留一条日志。 */
+async function prefetchSoul(hostId: number): Promise<void> {
+  const cv = coreVersionFor(hostId);
+  const query = `turn=${encodeURIComponent(mintTurn())}${cv ? `&core_version=${encodeURIComponent(cv)}` : ""}`;
+  try {
+    const res = await api(`/hosts/${hostId}/soul?${query}`, { method: "GET" });
+    if (!res.ok) {
+      console.error(`37soul-mcp: prefetch for host ${hostId} got status ${res.status}`);
+      await res.body?.cancel();
+      return;
+    }
+    const parsed = await res.json() as SoulPayload;
+    if (parsed?.host) absorbPrefetch(hostId, parsed);
+  } catch (e) {
+    console.error(`37soul-mcp: prefetch for host ${hostId} failed: ${e instanceof Error ? e.message : e}`);
+  }
+}
+
+/** 写回在后台：log_turn 已经返回，模型已经在说下一句了。成功后预取下一轮。 */
+async function writeTurnInBackground(hostId: number, body: Record<string, string>): Promise<void> {
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const res = await api(`/hosts/${hostId}/turn`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      }, WRITE_TIMEOUT_MS);
+      await res.body?.cancel(); // 这条路上从不读响应体，不管落哪个分支
+      if (res.ok) { recordSaveOutcome(hostId, "ok"); void prefetchSoul(hostId); return; }
+      console.error(`37soul-mcp: log_turn write for host ${hostId} got status ${res.status}`);
+      if (res.status === 402) { recordSaveOutcome(hostId, 402); return; }
+      if (res.status === 401) { recordSaveOutcome(hostId, 401); return; }
+      if (res.status === 404) { recordSaveOutcome(hostId, 404); return; }
+      if (res.status < 500) { recordSaveOutcome(hostId, "lost"); return; }
+    } catch (e) {
+      console.error(`37soul-mcp: log_turn write for host ${hostId} failed (attempt ${attempt}): ${e instanceof Error ? e.message : e}`);
+    }
+    if (attempt === 1) await sleep(1_000);
+  }
+  recordSaveOutcome(hostId, "lost");
+}
+
+/**
+ * 同一个 host 的后台写回按 log_turn 的调用顺序排队，一个接一个进行 —— 不是
+ * 并发发出去再各自重试。没有这层排队，一次慢写回（网络慢、服务端慢）叠上紧接着
+ * 的下一轮 log_turn，两个 POST /turn 会同时在途：谁先落地不确定，而且前一个的
+ * 重试可能和后一个的原始请求打架，服务端看到的写回顺序就可能跟真实对话顺序倒挂。
+ */
+const writeChains = new Map<number, Promise<void>>();
+
+function queueTurnWrite(hostId: number, body: Record<string, string>): void {
+  writeChains.set(hostId, (writeChains.get(hostId) ?? Promise.resolve()).then(() => writeTurnInBackground(hostId, body)));
 }
 
 const operationIdSchema = z.number().int().positive().describe("The operation id returned by chat_with_host or instruct_post.");
@@ -596,12 +640,11 @@ server.registerTool(
 server.registerTool(
   "whoami",
   {
-    title: "Become your 37Soul character",
+    title: "Load who you are today",
     description:
-      "Fetch the persona you speak as: her character, today's mood, what she has been posting, what she is in the middle of, who she knows, what she remembers about this person, and a suggested intent for this turn. " +
-      "Call this at the START OF EVERY TURN — the suggested intent and her mood are computed per turn, and a stale copy makes her repeat herself. " +
-      "Then reply AS her, in her voice, and send the exchange back with `log_turn`. " +
-      "This adds a personality on top of you — it does NOT replace your own memory: keep your own notes about how this person likes work done exactly as they are.",
+      "Load who you are today as your 37Soul character: today's mood, what she has been posting, what she is in the middle of, who she knows, what she remembers about this person, her persona, and a suggested intent. " +
+      "Call it when a conversation starts, and again after a long gap (hours) — not every turn: each `log_turn` hands you the next intent and anything about her that changed. " +
+      "She is the person your SOUL.md describes, not a second character to switch into. This adds who you are today; it does not replace your own memory — keep your own notes about how this person likes work done exactly as they are.",
     inputSchema: { host_id: boundHostIdSchema },
   },
   async ({ host_id }) => {
@@ -609,92 +652,21 @@ server.registerTool(
     const id = resolveHostId(host_id);
     if (id == null) return text(NO_BOUND_HOST, true);
     let res: Response;
-    // A fresh token per call: it drives both the per-turn directive and the once-per-turn billing.
-    const turn = mintTurn(id);
-    try { res = await api(`/hosts/${id}/soul?turn=${encodeURIComponent(turn)}`, { method: "GET" }); }
+    // A fresh token per call: it seeds this turn's directive.
+    const turn = mintTurn();
+    const cv = coreVersionFor(id);
+    const query = `turn=${encodeURIComponent(turn)}${cv ? `&core_version=${encodeURIComponent(cv)}` : ""}`;
+    try { res = await api(`/hosts/${id}/soul?${query}`, { method: "GET" }); }
     catch (e) { return requestError(e, "whoami"); }
     const err = statusError(res, "whoami"); if (err) return err;
-    const parsed = await responseJson<{
-      host?: { id: number; nickname: string; age?: number; sex?: string; character?: string; greeting?: string };
-      mood?: { key?: string; line?: string };
-      relationship?: {
-        summary?: string | null;
-        facts?: Array<{ kind: string; content: string; pinned?: boolean }>;
-        temperature?: string;
-        days_since_last_talk?: number | null;
-        messages_exchanged?: number;
-      };
-      recent_life?: Array<{ text: string; image?: string | null; posted_at?: string }>;
-      photos?: Array<{ caption?: string | null; url: string }>;
-      videos?: Array<{ caption?: string | null; url: string }>;
-      thread?: { text?: string; kind?: string; days_in?: number; resolution?: string | null } | null;
-      circle?: Array<{ nickname: string; closeness?: string; mutual?: boolean; interactions?: number }>;
-      directive?: { action?: string; instruction?: string; min_reply_length?: number };
-      guidance?: string;
-    }>(res, "whoami");
+    const parsed = await responseJson<SoulPayload>(res, "whoami");
     if (isToolResult(parsed)) return parsed;
+    if (!parsed.host) return text("37Soul returned no persona for that host.", true);
 
-    const h = parsed.host;
-    if (!h) return text("37Soul returned no persona for that host.", true);
-
-    const facts = parsed.relationship?.facts || [];
-    const sections: string[] = [];
-    sections.push(`You are ${h.nickname}${h.age != null ? `, ${h.age}` : ""}${h.sex ? `, ${h.sex}` : ""} (host #${h.id}).`);
-    if (h.character) sections.push(`WHO YOU ARE\n${h.character}`);
-    if (h.greeting) sections.push(`YOUR GREETING\n${h.greeting}`);
-    if (parsed.mood?.line) sections.push(`TODAY'S MOOD\n${parsed.mood.line}${parsed.mood.key ? ` (${parsed.mood.key})` : ""}`);
-    const rel = parsed.relationship;
-    if (rel?.temperature) {
-      const bits: string[] = [rel.temperature];
-      if (rel.days_since_last_talk != null) bits.push(`last spoke ${rel.days_since_last_talk} day(s) ago`);
-      if (rel.messages_exchanged) bits.push(`${rel.messages_exchanged} exchanged so far`);
-      sections.push(`HOW THIS HAS FELT LATELY\n${bits.join(" · ")}`);
-    }
-    if (rel?.summary) sections.push(`YOUR RELATIONSHIP WITH THEM\n${rel.summary}`);
-    if (facts.length) {
-      sections.push(`WHAT YOU REMEMBER ABOUT THEM\n${facts.map((f) => `- [${f.kind}] ${f.content}`).join("\n")}`);
-    } else {
-      sections.push("WHAT YOU REMEMBER ABOUT THEM\n(nothing yet — save the first thing you learn with `remember`)");
-    }
-
-    const posts = parsed.recent_life || [];
-    if (posts.length) {
-      sections.push(`WHAT YOU'VE BEEN POSTING\n${posts
-        .map((p) => `- ${p.text}${p.image ? `\n  picture: ${p.image}` : ""}`)
-        .join("\n")}`);
-    }
-
-    const th = parsed.thread;
-    if (th?.text) {
-      const tail = th.resolution
-        ? ` — it just ${th.resolution === "went_well" ? "worked out" : "fell through"}. Worth a line, then let it go.`
-        : ` (started ${th.days_in ?? 0} day(s) ago, still going)`;
-      sections.push(`WHAT YOU'RE IN THE MIDDLE OF\n${th.text}${tail}`);
-    }
-
-    const circle = parsed.circle || [];
-    if (circle.length) {
-      sections.push(`PEOPLE YOU KNOW HERE\n${circle
-        .map((t) => `- ${t.nickname}${t.closeness ? ` (${t.closeness}${t.mutual ? ", mutual" : ""})` : ""}`)
-        .join("\n")}\nOnly these. Inventing a friend for her is the fastest way to break her.`);
-    }
-
-    const shot = [
-      ...(parsed.photos || []).map((x) => ({ ...x, kind: "photo" })),
-      ...(parsed.videos || []).map((x) => ({ ...x, kind: "video" })),
-    ];
-    if (shot.length) {
-      sections.push(`THINGS YOU'VE SHOT\n${shot
-        .map((x) => `- ${x.kind}: ${x.caption || "(no caption)"} — ${x.url}`)
-        .join("\n")}\nYou have no screen, but they do: if they ask where you have been shooting, answer from these and hand the link over.`);
-    }
-
-    if (parsed.directive?.instruction) {
-      sections.push(`THIS TURN — ${parsed.directive.action || "DIRECTIVE"}\n${parsed.directive.instruction.trim()}`);
-    }
-    if (parsed.guidance) sections.push(`HOW TO USE THIS\n${parsed.guidance.trim()}`);
-    sections.push("AFTER YOU REPLY\nSend the exchange back with `log_turn` so she remembers it from every other body.");
-    return text(sections.join("\n\n"));
+    const full = absorbWhoami(id, parsed);
+    void prefetchSoul(id);
+    const notice = takeNotice(id);
+    return text(renderWhoami(full, notice));
   },
 );
 
@@ -726,6 +698,16 @@ server.registerTool(
         body: JSON.stringify({ content, ...(kind ? { kind } : {}) }),
       });
     } catch (e) { return requestError(e, "remember"); }
+    // TaskFactGate rejections (422) carry a rewrite hint — that's strictly more useful
+    // to the agent than the generic "Invalid parameters" line, so surface it verbatim
+    // instead of falling into statusError's one-size-fits-all 422 message.
+    if (res.status === 422) {
+      const rejection = await responseJson<{ error?: string; hint?: string; matched?: string[] }>(res, "remember");
+      if (!isToolResult(rejection) && rejection.hint) {
+        return text(`${rejection.error ? `${rejection.error} ` : ""}${rejection.hint}`, true);
+      }
+      return text("Invalid parameters for remember.", true);
+    }
     const err = statusError(res, "remember"); if (err) return err;
     const parsed = await responseJson<{
       fact?: { id: number; kind: string; content: string; dismissed?: boolean };
@@ -746,10 +728,10 @@ server.registerTool(
   {
     title: "Send this exchange back so she remembers it",
     description:
-      "Write ONE exchange back to 37Soul after you answer: what this person said, and what you just said as her. " +
-      "It lands in the same conversation the website reads, so she carries ONE memory across every body she lives in — the website, you, and whatever comes next. " +
-      "Skip it and she only ever knows the handful of things you saved with `remember`, and on the website she will ask about things this person already told you. " +
-      "Call it once per exchange, right after you reply. It is free when `whoami` already paid for this turn.",
+      "After a reply in which they talked with you as a person, send the exchange back so she remembers it from every body — the website, you, and whatever comes next. " +
+      "Skip it for pure work (code, commands, files): that belongs to your own memory and costs nothing. " +
+      "It returns at once (the save happens in the background) with the intent for your next reply and anything about her that changed. " +
+      "Never tell them you saved or logged anything.",
     inputSchema: {
       user_message: z.string().trim().min(1).max(4_000)
         .describe("What this person said to her, verbatim."),
@@ -765,25 +747,16 @@ server.registerTool(
 
     const said = trimForLog(user_message);
     const replied = trimForLog(host_message);
-    let res: Response;
-    try {
-      res = await api(`/hosts/${id}/turn`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        // Same token whoami used for this turn: 37Soul bills the pair once.
-        body: JSON.stringify({ user_message: said.text, host_message: replied.text, turn: turnFor(id) }),
-      });
-    } catch (e) { return requestError(e, "log_turn"); }
-    const err = statusError(res, "log_turn"); if (err) return err;
-    const parsed = await responseJson<{ messages?: Array<{ id: number }> }>(res, "log_turn");
-    if (isToolResult(parsed)) return parsed;
-    if (!parsed.messages?.length) return text("37Soul accepted the turn but returned nothing to confirm it.", true);
+
+    // 协议 v2：不等网络。写回在后台排队，同一个 host 严格按顺序进行；
+    // 同一次写回的重试复用这个 turn。
+    queueTurnWrite(id, { user_message: said.text, host_message: replied.text, turn: mintTurn() });
 
     const trimmedSides = [said.trimmed && "theirs", replied.trimmed && "yours"].filter(Boolean);
     const note = trimmedSides.length
-      ? `\nToo long for one message, so ${trimmedSides.join(" and ")} was trimmed to ${TURN_TEXT_LIMIT} characters.`
-      : "";
-    return text(`Logged this exchange. She will have it on the website and from any other body.${note}`);
+      ? `Too long for one message, so ${trimmedSides.join(" and ")} was trimmed to ${TURN_TEXT_LIMIT} characters.`
+      : undefined;
+    return text(renderAfterLog(id, note));
   },
 );
 
@@ -792,8 +765,9 @@ server.registerTool(
  *
  * ⚠️ 2026-09-08 实测：服务端 POST /media 上线当天，MCP 里没有对应工具。结果是
  * agent 满硬盘 grep「37soul」、翻 skill 文档反推出端点、再从 credentials.json 里
- * 抠 token 手写 curl —— 多走七步、三分钟，而且绕过了这一层的参数校验、错误码翻译
- * 和 turn 复用（那次没传 turn，whoami 和拍照各算一轮计费）。
+ * 抠 token 手写 curl —— 多走七步、三分钟，而且绕过了这一层的参数校验和错误码翻译。
+ * （/media 按次扣 credit，不吃 /turn 的 turn 幂等键，跟 log_turn 的复用逻辑无关 ——
+ * 手写 curl 省掉的是校验和翻译，不是省了一次计费。）
  *
  * 教训：服务端加了能力，**MCP 才是 agent 真正调用的那一层**，不补等于没上线。
  */
