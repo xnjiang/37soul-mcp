@@ -3,7 +3,7 @@
  * 37Soul MCP server — operate your 37Soul account from any MCP client.
  * Tools: list_hosts | get_host | update_host | read_host_photos | chat_with_host |
  *        read_chat_history | read_recent_posts | instruct_post | get_operation |
- *        whoami | remember | log_turn.
+ *        whoami | remember | log_turn | shoot.
  * Auth: SOUL37_API_TOKEN (SOUL_API_TOKEN remains a compatibility alias).
  * Base: SOUL37_BASE_URL (default https://37soul.com).
  * Bind:  SOUL37_HOST_ID (optional) — pin this server to one host so `whoami`,
@@ -35,8 +35,9 @@ const API_TIMEOUT_MS = Number.isFinite(configuredTimeout) && configuredTimeout >
 const POLL_REQUEST_TIMEOUT_MS = Math.min(API_TIMEOUT_MS, 2_000);
 // The background /turn write is off the interactive critical path — nothing is waiting on
 // it — so it should not inherit a short SOUL37_API_TIMEOUT_MS tuned for snappy foreground
-// calls. Give it its own floor.
-const WRITE_TIMEOUT_MS = Math.max(API_TIMEOUT_MS, 10_000);
+// calls. Give it its own floor — and a ceiling, so a very long SOUL37_API_TIMEOUT_MS
+// (configured for some other slow tool) can't leave a background write hanging forever.
+const WRITE_TIMEOUT_MS = Math.min(Math.max(API_TIMEOUT_MS, 10_000), 30_000);
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1_000;
 const OPERATION_STATE_PATH = process.env.SOUL37_OPERATION_STATE_PATH
   || join(process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "37soul-mcp", "operations.json");
@@ -236,7 +237,7 @@ const NO_BOUND_HOST = "No host selected. Either pass host_id, or set SOUL37_HOST
 const TURN_NONCE = randomUUID().slice(0, 8);
 let turnCounter = 0;
 
-function mintTurn(hostId: number): string {
+function mintTurn(): string {
   turnCounter += 1;
   return `${TURN_NONCE}-${turnCounter}`;
 }
@@ -253,11 +254,12 @@ function trimForLog(value: string): { text: string; trimmed: boolean } {
 /** 下一轮的她，趁模型还在写回复时从后台取好。失败不打扰任何人，但要留一条日志。 */
 async function prefetchSoul(hostId: number): Promise<void> {
   const cv = coreVersionFor(hostId);
-  const query = `turn=${encodeURIComponent(mintTurn(hostId))}${cv ? `&core_version=${encodeURIComponent(cv)}` : ""}`;
+  const query = `turn=${encodeURIComponent(mintTurn())}${cv ? `&core_version=${encodeURIComponent(cv)}` : ""}`;
   try {
     const res = await api(`/hosts/${hostId}/soul?${query}`, { method: "GET" });
     if (!res.ok) {
       console.error(`37soul-mcp: prefetch for host ${hostId} got status ${res.status}`);
+      await res.body?.cancel();
       return;
     }
     const parsed = await res.json() as SoulPayload;
@@ -276,6 +278,7 @@ async function writeTurnInBackground(hostId: number, body: Record<string, string
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       }, WRITE_TIMEOUT_MS);
+      await res.body?.cancel(); // 这条路上从不读响应体，不管落哪个分支
       if (res.ok) { recordSaveOutcome(hostId, "ok"); void prefetchSoul(hostId); return; }
       console.error(`37soul-mcp: log_turn write for host ${hostId} got status ${res.status}`);
       if (res.status === 402) { recordSaveOutcome(hostId, 402); return; }
@@ -637,7 +640,7 @@ server.registerTool(
 server.registerTool(
   "whoami",
   {
-    title: "Become your 37Soul character",
+    title: "Load who you are today",
     description:
       "Load who you are today as your 37Soul character: today's mood, what she has been posting, what she is in the middle of, who she knows, what she remembers about this person, her persona, and a suggested intent. " +
       "Call it when a conversation starts, and again after a long gap (hours) — not every turn: each `log_turn` hands you the next intent and anything about her that changed. " +
@@ -650,7 +653,7 @@ server.registerTool(
     if (id == null) return text(NO_BOUND_HOST, true);
     let res: Response;
     // A fresh token per call: it seeds this turn's directive.
-    const turn = mintTurn(id);
+    const turn = mintTurn();
     const cv = coreVersionFor(id);
     const query = `turn=${encodeURIComponent(turn)}${cv ? `&core_version=${encodeURIComponent(cv)}` : ""}`;
     try { res = await api(`/hosts/${id}/soul?${query}`, { method: "GET" }); }
@@ -695,6 +698,16 @@ server.registerTool(
         body: JSON.stringify({ content, ...(kind ? { kind } : {}) }),
       });
     } catch (e) { return requestError(e, "remember"); }
+    // TaskFactGate rejections (422) carry a rewrite hint — that's strictly more useful
+    // to the agent than the generic "Invalid parameters" line, so surface it verbatim
+    // instead of falling into statusError's one-size-fits-all 422 message.
+    if (res.status === 422) {
+      const rejection = await responseJson<{ error?: string; hint?: string; matched?: string[] }>(res, "remember");
+      if (!isToolResult(rejection) && rejection.hint) {
+        return text(`${rejection.error ? `${rejection.error} ` : ""}${rejection.hint}`, true);
+      }
+      return text("Invalid parameters for remember.", true);
+    }
     const err = statusError(res, "remember"); if (err) return err;
     const parsed = await responseJson<{
       fact?: { id: number; kind: string; content: string; dismissed?: boolean };
@@ -737,7 +750,7 @@ server.registerTool(
 
     // 协议 v2：不等网络。写回在后台排队，同一个 host 严格按顺序进行；
     // 同一次写回的重试复用这个 turn。
-    queueTurnWrite(id, { user_message: said.text, host_message: replied.text, turn: mintTurn(id) });
+    queueTurnWrite(id, { user_message: said.text, host_message: replied.text, turn: mintTurn() });
 
     const trimmedSides = [said.trimmed && "theirs", replied.trimmed && "yours"].filter(Boolean);
     const note = trimmedSides.length
@@ -752,8 +765,9 @@ server.registerTool(
  *
  * ⚠️ 2026-09-08 实测：服务端 POST /media 上线当天，MCP 里没有对应工具。结果是
  * agent 满硬盘 grep「37soul」、翻 skill 文档反推出端点、再从 credentials.json 里
- * 抠 token 手写 curl —— 多走七步、三分钟，而且绕过了这一层的参数校验、错误码翻译
- * 和 turn 复用（那次没传 turn，whoami 和拍照各算一轮计费）。
+ * 抠 token 手写 curl —— 多走七步、三分钟，而且绕过了这一层的参数校验和错误码翻译。
+ * （/media 按次扣 credit，不吃 /turn 的 turn 幂等键，跟 log_turn 的复用逻辑无关 ——
+ * 手写 curl 省掉的是校验和翻译，不是省了一次计费。）
  *
  * 教训：服务端加了能力，**MCP 才是 agent 真正调用的那一层**，不补等于没上线。
  */

@@ -150,6 +150,15 @@ const api = http.createServer((req, res) => {
       // 用户在网页上删过的那条：服务端返回墓碑，不复活。
       if (parsedBody.content === "不想再提前任")
         return send(200, { fact: { id: 9, kind: "fact", content: "不想再提前任", dismissed: true } });
+      // M10: TaskFactGate 拒收的任务型事实 —— 422 带改写建议，不是通用报错。
+      if (parsedBody.content === "run bin/render-build.sh to deploy")
+        return send(422, {
+          error: "This looks like a task fact, not something about the person.",
+          matched: ["shell_command", "source_extension"],
+          hint: "Build commands, code style and tooling belong in your own memory, not hers. If this really " +
+                "is about them — e.g. \"they are building a project called render-build\" — say it as a sentence " +
+                "about the person and send it again.",
+        });
       return send(201, { fact: { id: 8, kind: parsedBody.kind || "fact", content: parsedBody.content, dismissed: false } });
     }
     if (req.url.endsWith("/media") && req.method === "POST") {
@@ -520,8 +529,6 @@ check("402 明确禁用「账户/额度/充值」这几个词", async () => {
   const failed = await call("shoot", { host_id: 402 });
   assert.match(failed.text, /Do not say .*account.*credits.*top up/i);
 });
-const turnRequest = seen.filter((r) => r.url === "/api/v1/me/hosts/262/turn").at(-1);
-
 check("log_turn writes both sides back", () => {
   const turnRequests = seen.filter((r) => r.url === "/api/v1/me/hosts/262/turn");
   const first = turnRequests.find((r) => r.body.includes("我这周把猫接回来了"));
@@ -603,6 +610,13 @@ check("remember does not claim to have saved a fact the person deleted", () => {
   assert.match(tombstoned.text, /deleted/);
 });
 
+// M10: TaskFactGate 的 422 带改写建议，remember 要把它转述出来，而不是回通用报错。
+const taskFact = await call("remember", { host_id: 262, content: "run bin/render-build.sh to deploy" });
+check("remember 转述 422 的改写建议，而不是通用的 Invalid parameters", () => {
+  assert.ok(taskFact.isError);
+  assert.match(taskFact.text, /Build commands, code style and tooling belong in your own memory/i);
+  assert.doesNotMatch(taskFact.text, /^Invalid parameters for remember\.$/);
+});
 
 const errorCases = [
   [401, "instruct_post", /token/i],
