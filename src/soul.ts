@@ -50,9 +50,21 @@ type HostState = {
   nickname?: string;
   shown?: Snapshot;
   next?: SoulPayload;
+  nextFetchedAt?: number;
   notice?: string;
   saving?: SavingState;
+  lastWhoamiAt?: number;
+  shownCoreVersion?: string;
 };
+
+/**
+ * 隔多久没读 whoami 就该提醒模型重新读一遍。默认 6 小时，测试用
+ * `SOUL37_WHOAMI_STALE_MS` 调短（整数毫秒，≥1000）。
+ */
+const configuredWhoamiStaleMs = Number.parseInt(process.env.SOUL37_WHOAMI_STALE_MS || "", 10);
+const WHOAMI_STALE_MS = Number.isFinite(configuredWhoamiStaleMs) && configuredWhoamiStaleMs >= 1_000
+  ? configuredWhoamiStaleMs
+  : 6 * 60 * 60 * 1_000;
 
 const states = new Map<number, HostState>();
 
@@ -100,11 +112,18 @@ function cleanInstruction(raw: string): string {
     .trim();
 }
 
-/** 服务端回 core:"unchanged" 时，从缓存把核心补回去；否则刷新缓存。返回补齐后的 payload。 */
+/**
+ * 服务端回 core:"unchanged" 时，从缓存把核心补回去；否则刷新缓存。返回补齐后的 payload。
+ * 只在缓存的版本号和服务端说的这个版本号对得上时才敢补 —— 版本不对说明我们的缓存本身
+ * 就是过期或者根本没有的，"unchanged" 这种载荷从来不带人设原文，绝不能拿它建缓存。
+ */
 function withCore(s: HostState, p: SoulPayload): SoulPayload {
   if (p.host?.nickname) s.nickname = p.host.nickname;
-  if (p.core === "unchanged" && s.core && p.host) {
-    return { ...p, host: { ...p.host, character: s.core.character, greeting: s.core.greeting } };
+  if (p.core === "unchanged") {
+    if (s.core && s.core.version === p.core_version && p.host) {
+      return { ...p, host: { ...p.host, character: s.core.character, greeting: s.core.greeting } };
+    }
+    return p;
   }
   if (p.core_version) {
     s.core = { version: p.core_version, character: p.host?.character, greeting: p.host?.greeting };
@@ -116,14 +135,18 @@ export function absorbWhoami(hostId: number, payload: SoulPayload): SoulPayload 
   const s = stateFor(hostId);
   const full = withCore(s, payload);
   s.shown = snapshotOf(full);
+  s.lastWhoamiAt = Date.now();
+  s.shownCoreVersion = full.core_version ?? s.core?.version;
   // 这一轮的意图就在 whoami 的结果里；「下一轮」等后台预取来填。
   s.next = undefined;
+  s.nextFetchedAt = undefined;
   return full;
 }
 
 export function absorbPrefetch(hostId: number, payload: SoulPayload): void {
   const s = stateFor(hostId);
   s.next = withCore(s, payload);
+  s.nextFetchedAt = Date.now();
 }
 
 /** 取走一次性提示（给 whoami 用：它也该让模型知道上次没存上）。 */
@@ -253,12 +276,25 @@ export function renderAfterLog(hostId: number, extra?: string): string {
     lines.push(s.notice);
     s.notice = undefined;
   }
+
+  // 隔久了没读 whoami，或者人设换了版本：两者都值得让模型知道，但优先说更具体的那条。
+  const coreChanged = s.next?.core_version != null && s.shownCoreVersion != null && s.next.core_version !== s.shownCoreVersion;
+  const timeStale = s.lastWhoamiAt != null && Date.now() - s.lastWhoamiAt > WHOAMI_STALE_MS;
+  if (coreChanged) {
+    lines.push("Her persona changed — call whoami before your next reply.");
+  } else if (timeStale) {
+    lines.push("It has been a while — call whoami before your next reply.");
+  }
+
   if (s.next) {
     const now = snapshotOf(s.next);
     const changed = changesBetween(s.shown, now);
     if (changed.length) lines.push(`Since you last looked:\n${changed.join("\n")}`);
+    // 预取来的「下一轮」本身也可能坐太久了：与其把一个过期意图当成新的塞给模型，
+    // 不如干脆不给 —— 上面的 stale/coreChanged 提示已经让它知道该重新读 whoami 了。
+    const nextStale = s.nextFetchedAt != null && Date.now() - s.nextFetchedAt > WHOAMI_STALE_MS;
     const d = s.next.directive;
-    if (d?.instruction) {
+    if (d?.instruction && !nextStale) {
       let line = `For your NEXT reply (not the one you are finishing now) — ${d.action || "DIRECTIVE"}: ${cleanInstruction(d.instruction)}`;
       if (d.action === "CALLBACK") {
         const fact = s.next.relationship?.facts?.[0];
@@ -271,6 +307,7 @@ export function renderAfterLog(hostId: number, extra?: string): string {
     }
     s.shown = now;
     s.next = undefined;
+    s.nextFetchedAt = undefined;
   }
   if (extra) lines.push(extra);
   return lines.join("\n");

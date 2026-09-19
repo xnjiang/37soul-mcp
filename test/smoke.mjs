@@ -22,7 +22,7 @@ const operationsByKey = new Map();
 const seen = [];
 
 // 协议 v2：mock 的 /soul 带 you_are / core_version，并认 core_version 参数。
-const CORE_262 = "cv262";
+let CORE_262 = "cv262"; // I4: 需要在测试中间改一次版本，验证「人设变了」的提醒
 let soulMood = "今天有点想闹腾";
 let turnDelayMs = 0;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -197,12 +197,12 @@ const serverEnv = {
   SOUL37_OPERATION_STATE_PATH: statePath,
 };
 
-const connectClient = async (name) => {
+const connectClient = async (name, extraEnv = {}) => {
   const client = new Client({ name, version: "1" });
   await client.connect(new StdioClientTransport({
     command: "node",
     args: [SERVER],
-    env: serverEnv,
+    env: { ...serverEnv, ...extraEnv },
     stderr: "ignore",
   }));
   return client;
@@ -444,6 +444,19 @@ check("重试复用同一个 turn，而不是铸一个新的", () => {
   assert.equal(turns[0], turns[1]);
 });
 
+// ── I4: 隔久了没读 whoami，log_turn 要提醒 ────────────────────────
+// 独立进程、独立状态：只有它自己看得见自己的 lastWhoamiAt，不跟主流程的 host 262 state 打架。
+const staleClient = await connectClient("stale-whoami", { SOUL37_WHOAMI_STALE_MS: "1000" });
+const staleCall = async (name, args = {}) => {
+  const r = await staleClient.callTool({ name, arguments: args });
+  return { text: r.content[0].text, isError: !!r.isError };
+};
+await staleCall("whoami", { host_id: 262 });
+await sleep(1200);
+const staleLogged = await staleCall("log_turn", { host_id: 262, user_message: "hi", host_message: "hey" });
+check("隔久了没读 whoami，log_turn 提醒重新读", () => assert.match(staleLogged.text, /call whoami/i));
+await staleClient.close();
+
 // ── shoot ──────────────────────────────────────────────────────────
 // 服务端 2026-09-08 上线 POST /media 当天 MCP 没跟，agent 只好翻文档手写 curl。
 // 补上工具之后，这里守的是它**行为对**，不只是**存在**。
@@ -563,6 +576,16 @@ check("第二次 whoami 带 core_version，服务端省掉人设，渲染仍从�
   assert.match(soul2.text, /WHO YOU ARE\nnight owl illustrator/);
   assert.match(soul2.text, /YOUR GREETING\nhi/);
 });
+
+// ── I4: 人设变了要提醒 ─────────────────────────────────────────────
+// 这个 client 手里缓存的 core_version 还是 cv262（上面两次 whoami 都没有改过它）。
+// 现在把服务端的「当前版本」换掉，模拟「人设在别处被改了」：下一次写回触发的后台
+// 预取会带回新版本号，发现跟 shownCoreVersion 对不上，下下次 log_turn 就该提醒。
+CORE_262 = "cv262-v2";
+await call("log_turn", { host_id: 262, user_message: "core change 1", host_message: "core change 1 reply" });
+await sleep(500); // 让这次写回成功、触发的后台预取落地（拿到新版本号）
+const afterCoreChange = await call("log_turn", { host_id: 262, user_message: "core change 2", host_message: "core change 2 reply" });
+check("人设变了，log_turn 提醒重新读 whoami", () => assert.match(afterCoreChange.text, /Her persona changed/));
 
 const longTurn = await call("log_turn", { host_id: 262, user_message: "hi", host_message: "x".repeat(1200) });
 await sleep(300);
