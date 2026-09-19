@@ -144,8 +144,11 @@ const api = http.createServer((req, res) => {
       return send(201, { kind: "photo", url: "https://files.37soul.com/p/new.webp",
                          caption: "窗边的信封", credits_remaining: 94 });
     }
-    if (req.url === "/api/v1/me/hosts/262/turn" && req.method === "POST")
-      return send(201, { messages: [{ id: 21, source: "agent" }, { id: 22, source: "agent" }] });
+    if (req.url === "/api/v1/me/hosts/262/turn" && req.method === "POST") {
+      return setTimeout(() => send(201, { messages: [{ id: 21, source: "agent" }, { id: 22, source: "agent" }] }), turnDelayMs);
+    }
+    if (req.url === "/api/v1/me/hosts/402/turn" && req.method === "POST")
+      return send(402, { error: "Out of messages" });
     if (req.url.endsWith("/instruct") && req.method === "POST")
       return send(202, { operation: operation("post", String(req.headers["idempotency-key"])) });
     send(404, { error: "nope" });
@@ -338,7 +341,24 @@ check("whoami 结尾不再说「每次都回写」，并且不许把回写说给
   assert.match(soul.text, /never mention saving or logging/i);
 });
 
+// ── 协议 v2 · log_turn ──────────────────────────────────────────────
+// 等 whoami 之后那次后台预取落地，再改她的心情 —— 下一次预取才会看到变化。
+await sleep(300);
+soulMood = "有点累，但挺安静";
+turnDelayMs = 1500;
+const loggedAt = Date.now();
 const logged = await call("log_turn", { host_id: 262, user_message: "我这周把猫接回来了", host_message: "那家伙终于回家了" });
+const loggedTook = Date.now() - loggedAt;
+check("log_turn 不等网络（写回在后台）", () => assert.ok(loggedTook < 700, `took ${loggedTook}ms`));
+check("log_turn 明说不许告诉对方", () => assert.match(logged.text, /do not mention this to them/i));
+check("log_turn 再钉一次她是谁", () => assert.match(logged.text, /You are Nyx/));
+check("log_turn 交出下一轮的意图", () => assert.match(logged.text, /Next reply — SHARE/));
+await sleep(2000);
+const logged2 = await call("log_turn", { host_id: 262, user_message: "你今天怎么样", host_message: "有点累，不过还好" });
+check("她变了什么，跟着 log_turn 回来", () => assert.match(logged2.text, /有点累，但挺安静/));
+await sleep(2000);
+turnDelayMs = 0;
+check("后台预取带着 core_version，人设不重发", () => assert.match(soulUrls().at(-1), /core_version=cv262/));
 // ── shoot ──────────────────────────────────────────────────────────
 // 服务端 2026-09-08 上线 POST /media 当天 MCP 没跟，agent 只好翻文档手写 curl。
 // 补上工具之后，这里守的是它**行为对**，不只是**存在**。
@@ -405,15 +425,28 @@ check("402 明确禁用「账户/额度/充值」这几个词", async () => {
 const turnRequest = seen.filter((r) => r.url === "/api/v1/me/hosts/262/turn").at(-1);
 
 check("log_turn writes both sides back", () => {
-  assert.match(logged.text, /Logged this exchange/);
-  assert.match(turnRequest.body, /我这周把猫接回来了/);
-  assert.match(turnRequest.body, /那家伙终于回家了/);
+  const turnRequests = seen.filter((r) => r.url === "/api/v1/me/hosts/262/turn");
+  const first = turnRequests.find((r) => r.body.includes("我这周把猫接回来了"));
+  assert.ok(first, "the first exchange never reached /turn");
+  assert.match(first.body, /那家伙终于回家了/);
 });
 
-check("log_turn reuses the turn whoami paid for, so the exchange is billed once", () => {
-  const soulTurn = new URL(soulRequest.url, "http://x").searchParams.get("turn");
-  assert.equal(JSON.parse(turnRequest.body).turn, soulTurn);
+// 协议 v2：计费只在写回上，turn 是它的幂等键 —— 每一轮都得是新的。
+check("每次写回都带自己的 turn", () => {
+  const turns = seen.filter((r) => r.url === "/api/v1/me/hosts/262/turn").map((r) => JSON.parse(r.body).turn);
+  assert.ok(turns.length >= 2);
+  assert.equal(new Set(turns).size, turns.length);
 });
+
+const deniedAt = Date.now();
+const denied = await call("log_turn", { host_id: 402, user_message: "a", host_message: "b" });
+check("写回会被拒也照样立即返回", () => {
+  assert.equal(denied.isError, false);
+  assert.ok(Date.now() - deniedAt < 700);
+});
+await sleep(300);
+const afterDenied = await call("log_turn", { host_id: 402, user_message: "c", host_message: "d" });
+check("下一次调用说一次：上一轮没存上", () => assert.match(afterDenied.text, /was not saved/i));
 
 const soul2 = await call("whoami", { host_id: 262 });
 check("consecutive whoami calls do not reuse one turn token", () => {
@@ -434,6 +467,7 @@ check("第二次 whoami 带 core_version，服务端省掉人设，渲染仍从�
 });
 
 const longTurn = await call("log_turn", { host_id: 262, user_message: "hi", host_message: "x".repeat(1200) });
+await sleep(300);
 check("log_turn says which side it trimmed", () => {
   assert.match(longTurn.text, /trimmed to 800/);
   assert.equal(JSON.parse(seen.filter((r) => r.url === "/api/v1/me/hosts/262/turn").at(-1).body).host_message.length, 800);

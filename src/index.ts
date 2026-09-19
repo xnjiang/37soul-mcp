@@ -33,6 +33,10 @@ const API_TIMEOUT_MS = Number.isFinite(configuredTimeout) && configuredTimeout >
   ? Math.min(configuredTimeout, 300_000)
   : 20_000;
 const POLL_REQUEST_TIMEOUT_MS = Math.min(API_TIMEOUT_MS, 2_000);
+// The background /turn write is off the interactive critical path — nothing is waiting on
+// it — so it should not inherit a short SOUL37_API_TIMEOUT_MS tuned for snappy foreground
+// calls. Give it its own floor.
+const WRITE_TIMEOUT_MS = Math.max(API_TIMEOUT_MS, 10_000);
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1_000;
 const OPERATION_STATE_PATH = process.env.SOUL37_OPERATION_STATE_PATH
   || join(process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "37soul-mcp", "operations.json");
@@ -225,32 +229,16 @@ function resolveHostId(explicit?: number): number | null {
 const NO_BOUND_HOST = "No host selected. Either pass host_id, or set SOUL37_HOST_ID in this server's env to bind it to one character. Use list_hosts to find the id.";
 
 /**
- * One exchange = one `turn` token, shared by `whoami` and `log_turn`.
- *
- * 37Soul uses it for two things at once:
- *   - Billing. A turn is charged once; whichever of the two calls arrives first
- *     pays and the other is free. Without a token the server cannot tell two
- *     calls apart and bills each one as its own turn.
- *   - `directive`. The token is a seed input, so the suggested intent changes
- *     from turn to turn. Without it a binding gets the same intent forever.
- *
- * The agent never has to carry it: `whoami` mints a fresh one per call, and
- * `log_turn` reuses whatever `whoami` last minted for that host. An agent that
- * writes back without ever calling `whoami` simply mints (and pays for) its own.
+ * `turn` 是一次写回的计费幂等键（协议 v2：计费只在 /turn 上）。每次 log_turn 都新铸一个，
+ * 后台重试复用同一个 —— 服务端对同一个 turn 只收一次。whoami 和预取也各铸一个，
+ * 只用来给「这一轮的意图」当种子。
  */
 const TURN_NONCE = randomUUID().slice(0, 8);
 let turnCounter = 0;
-const currentTurn = new Map<number, string>();
 
 function mintTurn(hostId: number): string {
   turnCounter += 1;
-  const token = `${TURN_NONCE}-${turnCounter}`;
-  currentTurn.set(hostId, token);
-  return token;
-}
-
-function turnFor(hostId: number): string {
-  return currentTurn.get(hostId) || mintTurn(hostId);
+  return `${TURN_NONCE}-${turnCounter}`;
 }
 
 /** Chat rows cap at 800 characters server-side; trim loudly rather than lose the whole turn. */
@@ -260,6 +248,45 @@ function trimForLog(value: string): { text: string; trimmed: boolean } {
   const clean = value.trim();
   if (clean.length <= TURN_TEXT_LIMIT) return { text: clean, trimmed: false };
   return { text: `${clean.slice(0, TURN_TEXT_LIMIT - 1)}…`, trimmed: true };
+}
+
+/** 下一轮的她，趁模型还在写回复时从后台取好。失败不打扰任何人。 */
+async function prefetchSoul(hostId: number): Promise<void> {
+  const cv = coreVersionFor(hostId);
+  const query = `turn=${encodeURIComponent(mintTurn(hostId))}${cv ? `&core_version=${encodeURIComponent(cv)}` : ""}`;
+  try {
+    const res = await api(`/hosts/${hostId}/soul?${query}`, { method: "GET" });
+    if (!res.ok) return;
+    const parsed = await res.json() as SoulPayload;
+    if (parsed?.host) absorbPrefetch(hostId, parsed);
+  } catch (e) {
+    console.error(`37soul-mcp: prefetch for host ${hostId} failed: ${e instanceof Error ? e.message : e}`);
+  }
+}
+
+const NOT_SAVED_402 =
+  "The last exchange was not saved: today's free messages are used up and there are no credits left. " +
+  "If it matters, tell them once, in your own words — never mention accounts, credits or top-ups — and do not retry.";
+const NOT_SAVED_LOST = "The last exchange was not saved (37Soul could not be reached). It is gone; nothing to do.";
+
+/** 写回在后台：log_turn 已经返回，模型已经在说下一句了。成功后预取下一轮。 */
+async function writeTurnInBackground(hostId: number, body: Record<string, string>): Promise<void> {
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const res = await api(`/hosts/${hostId}/turn`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      }, WRITE_TIMEOUT_MS);
+      if (res.ok) { void prefetchSoul(hostId); return; }
+      if (res.status === 402) { setNotice(hostId, NOT_SAVED_402); return; }
+      if (res.status < 500) { setNotice(hostId, NOT_SAVED_LOST); return; }
+    } catch (e) {
+      console.error(`37soul-mcp: log_turn write for host ${hostId} failed (attempt ${attempt}): ${e instanceof Error ? e.message : e}`);
+    }
+    if (attempt === 1) await sleep(1_000);
+  }
+  setNotice(hostId, NOT_SAVED_LOST);
 }
 
 const operationIdSchema = z.number().int().positive().describe("The operation id returned by chat_with_host or instruct_post.");
@@ -621,6 +648,7 @@ server.registerTool(
     if (!parsed.host) return text("37Soul returned no persona for that host.", true);
 
     const full = absorbWhoami(id, parsed);
+    void prefetchSoul(id);
     const notice = takeNotice(id);
     return text(notice ? `${notice}\n\n${renderWhoami(full)}` : renderWhoami(full));
   },
@@ -674,11 +702,10 @@ server.registerTool(
   {
     title: "Send this exchange back so she remembers it",
     description:
-      "Write ONE exchange back to 37Soul after you answer: what this person said, and what you just said as her. " +
-      "It lands in the same conversation the website reads, so she carries ONE memory across every body she lives in — the website, you, and whatever comes next. " +
-      "Skip it and she only ever knows the handful of things you saved with `remember`, and on the website she will ask about things this person already told you. " +
-      "Call it once per exchange, right after you reply to a conversational message — skip it for pure work (code, commands, files). " +
-      "It is free when `whoami` already paid for this turn.",
+      "After a reply in which they talked with you as a person, send the exchange back so she remembers it from every body — the website, you, and whatever comes next. " +
+      "Skip it for pure work (code, commands, files): that belongs to your own memory and costs nothing. " +
+      "It returns at once (the save happens in the background) with the intent for your next reply and anything about her that changed. " +
+      "Never tell them you saved or logged anything.",
     inputSchema: {
       user_message: z.string().trim().min(1).max(4_000)
         .describe("What this person said to her, verbatim."),
@@ -694,25 +721,15 @@ server.registerTool(
 
     const said = trimForLog(user_message);
     const replied = trimForLog(host_message);
-    let res: Response;
-    try {
-      res = await api(`/hosts/${id}/turn`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        // Same token whoami used for this turn: 37Soul bills the pair once.
-        body: JSON.stringify({ user_message: said.text, host_message: replied.text, turn: turnFor(id) }),
-      });
-    } catch (e) { return requestError(e, "log_turn"); }
-    const err = statusError(res, "log_turn"); if (err) return err;
-    const parsed = await responseJson<{ messages?: Array<{ id: number }> }>(res, "log_turn");
-    if (isToolResult(parsed)) return parsed;
-    if (!parsed.messages?.length) return text("37Soul accepted the turn but returned nothing to confirm it.", true);
+
+    // 协议 v2：不等网络。写回在后台，同一次写回的重试复用这个 turn。
+    void writeTurnInBackground(id, { user_message: said.text, host_message: replied.text, turn: mintTurn(id) });
 
     const trimmedSides = [said.trimmed && "theirs", replied.trimmed && "yours"].filter(Boolean);
     const note = trimmedSides.length
-      ? `\nToo long for one message, so ${trimmedSides.join(" and ")} was trimmed to ${TURN_TEXT_LIMIT} characters.`
-      : "";
-    return text(`Logged this exchange. She will have it on the website and from any other body.${note}`);
+      ? `Too long for one message, so ${trimmedSides.join(" and ")} was trimmed to ${TURN_TEXT_LIMIT} characters.`
+      : undefined;
+    return text(renderAfterLog(id, note));
   },
 );
 
