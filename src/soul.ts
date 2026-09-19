@@ -83,6 +83,19 @@ function changesBetween(before: Snapshot | undefined, after: Snapshot): string[]
   return lines;
 }
 
+/**
+ * 服务端的指令原文是给站内 prompt 用的，带 `---` 分隔线和 `THIS TURN — WORD:` 前缀。
+ * 对 agent 来说这两样都是噪音（`---` 像是被截断了，`THIS TURN` 前缀跟外面渲染的
+ * 段落标题重复）——把它们去掉，只留给模型看的那句话本身。
+ */
+function cleanInstruction(raw: string): string {
+  return raw
+    .trim()
+    .replace(/^---\s*/, "")
+    .replace(/^THIS TURN — \w+:\s*/, "")
+    .trim();
+}
+
 /** 服务端回 core:"unchanged" 时，从缓存把核心补回去；否则刷新缓存。返回补齐后的 payload。 */
 function withCore(s: HostState, p: SoulPayload): SoulPayload {
   if (p.host?.nickname) s.nickname = p.host.nickname;
@@ -176,7 +189,7 @@ export function renderWhoami(p: SoulPayload): string {
   }
 
   if (p.directive?.instruction) {
-    sections.push(`THIS TURN — ${p.directive.action || "DIRECTIVE"}\n${p.directive.instruction.trim()}`);
+    sections.push(`THIS TURN — ${p.directive.action || "DIRECTIVE"}\n${cleanInstruction(p.directive.instruction)}`);
   }
   if (p.guidance) sections.push(`HOW TO USE THIS\n${p.guidance.trim()}`);
   sections.push(
@@ -203,7 +216,17 @@ export function renderAfterLog(hostId: number, extra?: string): string {
     const changed = changesBetween(s.shown, now);
     if (changed.length) lines.push(`Since you last looked:\n${changed.join("\n")}`);
     const d = s.next.directive;
-    if (d?.instruction) lines.push(`Next reply — ${d.action || "DIRECTIVE"}: ${d.instruction.trim()}`);
+    if (d?.instruction) {
+      let line = `For your NEXT reply (not the one you are finishing now) — ${d.action || "DIRECTIVE"}: ${cleanInstruction(d.instruction)}`;
+      if (d.action === "CALLBACK") {
+        const fact = s.next.relationship?.facts?.[0];
+        if (fact?.content) line += ` (bring this back: ${fact.content})`;
+      } else if (d.action === "SHARE") {
+        const post = s.next.recent_life?.[0];
+        if (post?.text) line += ` (from your week: ${post.text})`;
+      }
+      lines.push(line);
+    }
     s.shown = now;
     s.next = undefined;
   }

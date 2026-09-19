@@ -124,7 +124,11 @@ const api = http.createServer((req, res) => {
         videos: [{ caption: "风车", url: "https://files.example/mill.mp4" }],
         thread: { text: "把那批照片重新洗一遍", kind: "doing", days_in: 2, resolution: null },
         circle: [{ nickname: "沈青", closeness: "familiar", mutual: true, interactions: 5 }],
-        directive: { action: "SHARE", instruction: "THIS TURN — SHARE: bring up your own week.", min_reply_length: 150 },
+        directive: {
+          action: "SHARE",
+          instruction: "---\nTHIS TURN — SHARE: Answer them briefly, then bring up something from your own week.",
+          min_reply_length: 150,
+        },
         // 后端终审裁定：guidance 每次都发（三条禁令管的是每次都发的字段），core_version 只省人设原文。
         guidance: "You are still yourself.",
         ...(unchanged ? { core: "unchanged" } : {}),
@@ -337,6 +341,13 @@ check("whoami renders her own life, not just her character", () => {
 check("whoami tells the agent to send the exchange back", () =>
   assert.match(soul.text, /log_turn/));
 
+check("whoami 的 THIS TURN 正文里站内格式已经洗掉了", () => {
+  const thisTurnSection = soul.text.split("\n\n").find((section) => section.startsWith("THIS TURN —"));
+  assert.ok(thisTurnSection, "no THIS TURN section rendered");
+  assert.doesNotMatch(thisTurnSection, /---/);
+  assert.doesNotMatch(thisTurnSection, /THIS TURN — SHARE:/); // 前缀只在标题行，不在正文里重复
+});
+
 // ── 协议 v2 · whoami ────────────────────────────────────────────────
 const soulUrls = () => seen.filter((r) => r.url.startsWith("/api/v1/me/hosts/262/soul")).map((r) => r.url);
 check("第一次 whoami 手上没有缓存，要完整的核心", () =>
@@ -368,7 +379,14 @@ const loggedTook = Date.now() - loggedAt;
 check("log_turn 不等网络（写回在后台）", () => assert.ok(loggedTook < 700, `took ${loggedTook}ms`));
 check("log_turn 明说不许告诉对方", () => assert.match(logged.text, /do not mention this to them/i));
 check("log_turn 再钉一次她是谁", () => assert.match(logged.text, /You are Nyx/));
-check("log_turn 交出下一轮的意图", () => assert.match(logged.text, /Next reply — SHARE/));
+check("log_turn 交出下一轮的意图，说明是下一句不是这一句", () =>
+  assert.match(logged.text, /For your NEXT reply \(not the one you are finishing now\) — SHARE/));
+check("log_turn 的下一轮意图带上这周的素材", () =>
+  assert.match(logged.text, /\(from your week: 今天把稿子改完了\)/));
+check("log_turn 的下一轮意图里站内格式已经洗掉了", () => {
+  assert.doesNotMatch(logged.text, /---/);
+  assert.doesNotMatch(logged.text, /THIS TURN —/);
+});
 await sleep(2000);
 const logged2 = await call("log_turn", { host_id: 262, user_message: "你今天怎么样", host_message: "有点累，不过还好" });
 check("她变了什么，跟着 log_turn 回来", () => assert.match(logged2.text, /有点累，但挺安静/));
