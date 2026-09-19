@@ -134,6 +134,17 @@ const api = http.createServer((req, res) => {
         ...(unchanged ? { core: "unchanged" } : {}),
       });
     }
+    // I3: 402 host 的 /soul，同样的形状，不一样的名字 —— 用来验证提示排在身份之后，
+    // you_are 仍然是第一行。
+    if (req.url.startsWith("/api/v1/me/hosts/402/soul") && req.method === "GET") {
+      return send(200, {
+        you_are: "You are Rae, 24, female (host #402) — the same person your SOUL.md describes; what follows is what is true of her today.",
+        host: { id: 402, nickname: "Rae", age: 24, sex: "female", character: "quiet baker", greeting: "hey" },
+        core_version: "cv402",
+        mood: { key: "calm", line: "还行" },
+        relationship: { summary: null, facts: [], temperature: "new", days_since_last_talk: null, messages_exchanged: 0 },
+      });
+    }
     if (req.url === "/api/v1/me/hosts/262/facts" && req.method === "POST") {
       const parsedBody = JSON.parse(body || "{}");
       // 用户在网页上删过的那条：服务端返回墓碑，不复活。
@@ -518,9 +529,22 @@ check("写回会被拒也照样立即返回", () => {
   assert.equal(denied.isError, false);
   assert.ok(Date.now() - deniedAt < 700);
 });
-await sleep(300);
+await sleep(300); // 让刚才那次写回落地、转成 "refused"，提示挂起
+const soul402 = await call("whoami", { host_id: 402 });
+check("提示挂起时，whoami 第一行仍然是 you_are，不是提示", () =>
+  assert.match(soul402.text.split("\n")[0], /Rae/));
+check("第一次转进 refused：下一次调用（这里是 whoami）说一次「没存上」", () => {
+  assert.match(soul402.text, /An earlier exchange was not saved/);
+  assert.match(soul402.text, /do not retry/);
+});
+
 const afterDenied = await call("log_turn", { host_id: 402, user_message: "c", host_message: "d" });
-check("下一次调用说一次：上一轮没存上", () => assert.match(afterDenied.text, /was not saved/i));
+await sleep(300); // 这次写回同样 402，但状态没变（还是 refused）——不应该再提一次
+const afterDenied2 = await call("log_turn", { host_id: 402, user_message: "e", host_message: "f" });
+check("再来的 402 不会重复提示", () => {
+  assert.doesNotMatch(afterDenied.text, /was not saved/i);
+  assert.doesNotMatch(afterDenied2.text, /was not saved/i);
+});
 
 const soul2 = await call("whoami", { host_id: 262 });
 check("consecutive whoami calls do not reuse one turn token", () => {

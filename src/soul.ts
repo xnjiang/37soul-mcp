@@ -42,12 +42,16 @@ type Core = { version: string; character?: string; greeting?: string };
 /** 给模型看过的「今天的她」，只留会变、且值得提一句的三样。 */
 type Snapshot = { mood?: string; thread?: string; latestPost?: string };
 
+/** 上一次写回落地了没有：ok 正常、refused 是账单性拒绝(402)、lost 是别的都存不上。 */
+type SavingState = "ok" | "refused" | "lost" | "unknown";
+
 type HostState = {
   core?: Core;
   nickname?: string;
   shown?: Snapshot;
   next?: SoulPayload;
   notice?: string;
+  saving?: SavingState;
 };
 
 const states = new Map<number, HostState>();
@@ -122,10 +126,6 @@ export function absorbPrefetch(hostId: number, payload: SoulPayload): void {
   s.next = withCore(s, payload);
 }
 
-export function setNotice(hostId: number, notice: string): void {
-  stateFor(hostId).notice = notice;
-}
-
 /** 取走一次性提示（给 whoami 用：它也该让模型知道上次没存上）。 */
 export function takeNotice(hostId: number): string | undefined {
   const s = stateFor(hostId);
@@ -134,7 +134,47 @@ export function takeNotice(hostId: number): string | undefined {
   return n;
 }
 
-export function renderWhoami(p: SoulPayload): string {
+const SAVE_NOTICE_TEXT = {
+  refused:
+    "An earlier exchange was not saved: today's free messages are used up and there are no credits left. " +
+    "If it matters, tell them once, in your own words — never mention accounts, credits or top-ups — and keep going; do not retry.",
+  unauthorized:
+    "Exchanges are not being saved: the 37Soul token was rejected. Tell the person once that their agent needs a new token from 37soul.com/agent_access.",
+  wrongHost: "Exchanges are not being saved: that host id is not theirs. Check SOUL37_HOST_ID.",
+  lost: "The last exchange was not saved (37Soul could not be reached). It is gone; nothing to do.",
+} as const;
+
+/** 一次写回失败的分类：402 是账单性拒绝；401/404 是配置错了；别的（其它 4xx、网络失败）算「丢了」。 */
+export type SaveOutcome = "ok" | 401 | 402 | 404 | "lost";
+
+function savingBucketFor(outcome: SaveOutcome): SavingState {
+  if (outcome === "ok") return "ok";
+  if (outcome === 402) return "refused";
+  return "lost";
+}
+
+function noticeTextFor(outcome: Exclude<SaveOutcome, "ok">): string {
+  if (outcome === 402) return SAVE_NOTICE_TEXT.refused;
+  if (outcome === 401) return SAVE_NOTICE_TEXT.unauthorized;
+  if (outcome === 404) return SAVE_NOTICE_TEXT.wrongHost;
+  return SAVE_NOTICE_TEXT.lost;
+}
+
+/**
+ * 写回落地与否，只在**换了状态**的那一次说一句 —— 同一种失败连着来不会重复念叨。
+ * 一次成功（"ok"）把状态收回原点，为下一次失败的提示让路，但它本身不出声。
+ * 401/404 是配置错了，不会像 402 那样等账户充值自己恢复，但同理不该每次写回都念。
+ */
+export function recordSaveOutcome(hostId: number, outcome: SaveOutcome): void {
+  const s = stateFor(hostId);
+  const previous = s.saving ?? "unknown";
+  const next = savingBucketFor(outcome);
+  s.saving = next;
+  if (outcome === "ok" || next === previous) return;
+  s.notice = noticeTextFor(outcome);
+}
+
+export function renderWhoami(p: SoulPayload, notice?: string): string {
   const h = p.host!;
   const facts = p.relationship?.facts || [];
   const sections: string[] = [];
@@ -192,6 +232,8 @@ export function renderWhoami(p: SoulPayload): string {
     sections.push(`THIS TURN — ${p.directive.action || "DIRECTIVE"}\n${cleanInstruction(p.directive.instruction)}`);
   }
   if (p.guidance) sections.push(`HOW TO USE THIS\n${p.guidance.trim()}`);
+  // 提示排在人设之后：you_are 必须是第一行，提示不该挤到前面显得比「她是谁」更要紧。
+  if (notice) sections.push(notice);
   sections.push(
     "AFTER YOU REPLY\nIf they were talking with you as a person, send the exchange back with `log_turn`; " +
     "skip it for pure work (code, commands, files). Never mention saving or logging to them.",

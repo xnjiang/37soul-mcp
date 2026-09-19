@@ -17,7 +17,7 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { z } from "zod";
-import { absorbPrefetch, absorbWhoami, coreVersionFor, renderAfterLog, renderWhoami, setNotice, takeNotice, type SoulPayload } from "./soul.js";
+import { absorbPrefetch, absorbWhoami, coreVersionFor, recordSaveOutcome, renderAfterLog, renderWhoami, takeNotice, type SoulPayload } from "./soul.js";
 
 const BASE_URL = (process.env.SOUL37_BASE_URL || "https://37soul.com").replace(/\/+$/, "");
 const TOKEN = process.env.SOUL37_API_TOKEN || process.env.SOUL_API_TOKEN || "";
@@ -250,24 +250,22 @@ function trimForLog(value: string): { text: string; trimmed: boolean } {
   return { text: `${clean.slice(0, TURN_TEXT_LIMIT - 1)}…`, trimmed: true };
 }
 
-/** 下一轮的她，趁模型还在写回复时从后台取好。失败不打扰任何人。 */
+/** 下一轮的她，趁模型还在写回复时从后台取好。失败不打扰任何人，但要留一条日志。 */
 async function prefetchSoul(hostId: number): Promise<void> {
   const cv = coreVersionFor(hostId);
   const query = `turn=${encodeURIComponent(mintTurn(hostId))}${cv ? `&core_version=${encodeURIComponent(cv)}` : ""}`;
   try {
     const res = await api(`/hosts/${hostId}/soul?${query}`, { method: "GET" });
-    if (!res.ok) return;
+    if (!res.ok) {
+      console.error(`37soul-mcp: prefetch for host ${hostId} got status ${res.status}`);
+      return;
+    }
     const parsed = await res.json() as SoulPayload;
     if (parsed?.host) absorbPrefetch(hostId, parsed);
   } catch (e) {
     console.error(`37soul-mcp: prefetch for host ${hostId} failed: ${e instanceof Error ? e.message : e}`);
   }
 }
-
-const NOT_SAVED_402 =
-  "The last exchange was not saved: today's free messages are used up and there are no credits left. " +
-  "If it matters, tell them once, in your own words — never mention accounts, credits or top-ups — and do not retry.";
-const NOT_SAVED_LOST = "The last exchange was not saved (37Soul could not be reached). It is gone; nothing to do.";
 
 /** 写回在后台：log_turn 已经返回，模型已经在说下一句了。成功后预取下一轮。 */
 async function writeTurnInBackground(hostId: number, body: Record<string, string>): Promise<void> {
@@ -278,15 +276,18 @@ async function writeTurnInBackground(hostId: number, body: Record<string, string
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       }, WRITE_TIMEOUT_MS);
-      if (res.ok) { void prefetchSoul(hostId); return; }
-      if (res.status === 402) { setNotice(hostId, NOT_SAVED_402); return; }
-      if (res.status < 500) { setNotice(hostId, NOT_SAVED_LOST); return; }
+      if (res.ok) { recordSaveOutcome(hostId, "ok"); void prefetchSoul(hostId); return; }
+      console.error(`37soul-mcp: log_turn write for host ${hostId} got status ${res.status}`);
+      if (res.status === 402) { recordSaveOutcome(hostId, 402); return; }
+      if (res.status === 401) { recordSaveOutcome(hostId, 401); return; }
+      if (res.status === 404) { recordSaveOutcome(hostId, 404); return; }
+      if (res.status < 500) { recordSaveOutcome(hostId, "lost"); return; }
     } catch (e) {
       console.error(`37soul-mcp: log_turn write for host ${hostId} failed (attempt ${attempt}): ${e instanceof Error ? e.message : e}`);
     }
     if (attempt === 1) await sleep(1_000);
   }
-  setNotice(hostId, NOT_SAVED_LOST);
+  recordSaveOutcome(hostId, "lost");
 }
 
 /**
@@ -662,7 +663,7 @@ server.registerTool(
     const full = absorbWhoami(id, parsed);
     void prefetchSoul(id);
     const notice = takeNotice(id);
-    return text(notice ? `${notice}\n\n${renderWhoami(full)}` : renderWhoami(full));
+    return text(renderWhoami(full, notice));
   },
 );
 
