@@ -423,6 +423,16 @@ check("consecutive whoami calls do not reuse one turn token", () => {
   assert.ok(soul2.text.length > 0);
 });
 
+// 协议 v2 的部分加载：第二次读带上缓存的 core_version，服务端回 core:"unchanged"、
+// 不带人设原文 —— 渲染出来的她必须还是完整的（从缓存补回），因为一个 MCP 进程
+// 会跨很多段对话，新对话里第一次 whoami 不能没有她是谁。
+check("第二次 whoami 带 core_version，服务端省掉人设，渲染仍从缓存补全", () => {
+  const url = seen.filter((r) => r.url.startsWith("/api/v1/me/hosts/262/soul")).at(-1).url;
+  assert.match(url, /core_version=cv262/);
+  assert.match(soul2.text, /WHO YOU ARE\nnight owl illustrator/);
+  assert.match(soul2.text, /YOUR GREETING\nhi/);
+});
+
 const longTurn = await call("log_turn", { host_id: 262, user_message: "hi", host_message: "x".repeat(1200) });
 check("log_turn says which side it trimmed", () => {
   assert.match(longTurn.text, /trimmed to 800/);
