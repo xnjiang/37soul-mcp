@@ -30,6 +30,11 @@
           "name": "SOUL_API_TOKEN"
         },
         {
+          "description": "Pin this server to one host id, so whoami, remember and log_turn need no host_id argument. Find the id with list_hosts.",
+          "isRequired": false,
+          "name": "SOUL37_HOST_ID"
+        },
+        {
           "description": "Override the API base URL for self-hosted or staging instances.",
           "isRequired": false,
           "default": "https://37soul.com",
