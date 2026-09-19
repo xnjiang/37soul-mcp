@@ -27,6 +27,12 @@ let soulMood = "今天有点想闹腾";
 let turnDelayMs = 0;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// I1: 追踪 /turn 是否曾经并发在途 —— 在请求体读完（路由分支执行）时加一，
+// 在延迟响应发出之后减一。真正串行的写回永远看不到「加一时已经有一个在途」。
+let turnInFlight = 0;
+let turnOverlap = false;
+let host500Attempts = 0;
+
 const operation = (action, idempotencyKey) => {
   const existing = operationsByKey.get(`${action}:${idempotencyKey}`);
   if (existing) return { id: existing.id, action, status: "queued", result: {}, error: null };
@@ -145,10 +151,20 @@ const api = http.createServer((req, res) => {
                          caption: "窗边的信封", credits_remaining: 94 });
     }
     if (req.url === "/api/v1/me/hosts/262/turn" && req.method === "POST") {
-      return setTimeout(() => send(201, { messages: [{ id: 21, source: "agent" }, { id: 22, source: "agent" }] }), turnDelayMs);
+      if (turnInFlight > 0) turnOverlap = true;
+      turnInFlight++;
+      return setTimeout(() => {
+        send(201, { messages: [{ id: 21, source: "agent" }, { id: 22, source: "agent" }] });
+        turnInFlight--;
+      }, turnDelayMs);
     }
     if (req.url === "/api/v1/me/hosts/402/turn" && req.method === "POST")
       return send(402, { error: "Out of messages" });
+    if (req.url === "/api/v1/me/hosts/500/turn" && req.method === "POST") {
+      host500Attempts++;
+      if (host500Attempts === 1) return send(500, { error: "boom" });
+      return send(201, { messages: [] });
+    }
     if (req.url.endsWith("/instruct") && req.method === "POST")
       return send(202, { operation: operation("post", String(req.headers["idempotency-key"])) });
     send(404, { error: "nope" });
@@ -359,6 +375,46 @@ check("她变了什么，跟着 log_turn 回来", () => assert.match(logged2.tex
 await sleep(2000);
 turnDelayMs = 0;
 check("后台预取带着 core_version，人设不重发", () => assert.match(soulUrls().at(-1), /core_version=cv262/));
+
+// ── I1: 同一个角色的后台写回排队 ──────────────────────────────────
+turnDelayMs = 800;
+turnInFlight = 0;
+turnOverlap = false;
+const serializedAt = Date.now();
+const [logA, logB] = await Promise.all([
+  call("log_turn", { host_id: 262, user_message: "queue one", host_message: "reply one" }),
+  call("log_turn", { host_id: 262, user_message: "queue two", host_message: "reply two" }),
+]);
+check("两次 log_turn 都立即返回，不等排队里的写回", () => {
+  assert.equal(logA.isError, false);
+  assert.equal(logB.isError, false);
+  assert.ok(Date.now() - serializedAt < 700);
+});
+await sleep(2200); // 两次 800ms 的写回严格串行需要 ~1600ms+，留够余量
+check("同一个角色的后台写回严格排队，不会并发在途", () => assert.equal(turnOverlap, false));
+check("两次写回按 log_turn 的调用顺序落地", () => {
+  const queueRequests = seen.filter((r) => r.url === "/api/v1/me/hosts/262/turn" && r.method === "POST");
+  const indexOne = queueRequests.findIndex((r) => r.body.includes("queue one"));
+  const indexTwo = queueRequests.findIndex((r) => r.body.includes("queue two"));
+  assert.ok(indexOne !== -1 && indexTwo !== -1);
+  assert.ok(indexOne < indexTwo);
+});
+turnDelayMs = 0;
+
+const retryAt = Date.now();
+const retried = await call("log_turn", { host_id: 500, user_message: "retry me", host_message: "ok" });
+check("会先失败一次的写回也立即返回", () => {
+  assert.equal(retried.isError, false);
+  assert.ok(Date.now() - retryAt < 700);
+});
+await sleep(1500);
+check("重试复用同一个 turn，而不是铸一个新的", () => {
+  const retryRequests = seen.filter((r) => r.url === "/api/v1/me/hosts/500/turn" && r.method === "POST");
+  assert.equal(retryRequests.length, 2);
+  const turns = retryRequests.map((r) => JSON.parse(r.body).turn);
+  assert.equal(turns[0], turns[1]);
+});
+
 // ── shoot ──────────────────────────────────────────────────────────
 // 服务端 2026-09-08 上线 POST /media 当天 MCP 没跟，agent 只好翻文档手写 curl。
 // 补上工具之后，这里守的是它**行为对**，不只是**存在**。

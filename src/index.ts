@@ -289,6 +289,18 @@ async function writeTurnInBackground(hostId: number, body: Record<string, string
   setNotice(hostId, NOT_SAVED_LOST);
 }
 
+/**
+ * 同一个 host 的后台写回按 log_turn 的调用顺序排队，一个接一个进行 —— 不是
+ * 并发发出去再各自重试。没有这层排队，一次慢写回（网络慢、服务端慢）叠上紧接着
+ * 的下一轮 log_turn，两个 POST /turn 会同时在途：谁先落地不确定，而且前一个的
+ * 重试可能和后一个的原始请求打架，服务端看到的写回顺序就可能跟真实对话顺序倒挂。
+ */
+const writeChains = new Map<number, Promise<void>>();
+
+function queueTurnWrite(hostId: number, body: Record<string, string>): void {
+  writeChains.set(hostId, (writeChains.get(hostId) ?? Promise.resolve()).then(() => writeTurnInBackground(hostId, body)));
+}
+
 const operationIdSchema = z.number().int().positive().describe("The operation id returned by chat_with_host or instruct_post.");
 const hostCharacterSchema = z.string().trim().min(1).max(1_000).optional().describe("Updated character/personality text (up to 1,000 characters).");
 const hostGreetingSchema = z.string().trim().max(800).optional().describe("Updated greeting text (up to 800 characters; use an empty string to clear it).");
@@ -722,8 +734,9 @@ server.registerTool(
     const said = trimForLog(user_message);
     const replied = trimForLog(host_message);
 
-    // 协议 v2：不等网络。写回在后台，同一次写回的重试复用这个 turn。
-    void writeTurnInBackground(id, { user_message: said.text, host_message: replied.text, turn: mintTurn(id) });
+    // 协议 v2：不等网络。写回在后台排队，同一个 host 严格按顺序进行；
+    // 同一次写回的重试复用这个 turn。
+    queueTurnWrite(id, { user_message: said.text, host_message: replied.text, turn: mintTurn(id) });
 
     const trimmedSides = [said.trimmed && "theirs", replied.trimmed && "yours"].filter(Boolean);
     const note = trimmedSides.length
